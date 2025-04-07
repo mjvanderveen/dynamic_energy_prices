@@ -1,0 +1,27 @@
+# Exclude raw data JSON files
+raw_consumption_data.json
+raw_production_data.json
+
+# Exclude the results folder
+results/*.csv
+
+# Exclude the config.json file
+config.json
+
+# Exclude workspace files
+*.code-workspace
+
+
+
+# General Python exclusions
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.env
+*.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
