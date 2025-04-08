@@ -24,5 +24,15 @@
         "ENERGY_TAX_COMPENSATION": -52.93
     },
     "DEBUG": true,
-    "STOP_PRODUCTION_NEGATIVE_PRICES": true
+    "STOP_PRODUCTION_NEGATIVE_PRICES": true,
+    "BATTERY_SIMULATION": {
+        "ENABLE": true,
+        "BATTERY_CHARGE_STRATEGY": "self-sufficiency",
+        "BATTERY_NAME": "Home Battery",
+        "BATTERY_SIZE_KWH": 10.0,
+        "MAX_CHARGING_RATE_KWH": 2.0,
+        "MAX_DISCHARGING_RATE_KWH": 2.0,
+        "ROUND_TRIP_EFFICIENCY": 0.96,
+        "DISCHARGE_LIMIT": 10
+    }
 }

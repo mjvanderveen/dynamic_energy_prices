@@ -286,15 +286,105 @@ def process_sensor_data(sensor_data):
 
     return hourly_totals
 
+def simulate_battery(hourly_consumption, hourly_production, battery_state, config, total_price_incl_vat_production, timestamp, strategy):
+    """
+    Simulate the behavior of a battery for a single hour based on the chosen strategy.
+
+    Args:
+        hourly_consumption (float): The energy consumption for the hour (kWh).
+        hourly_production (float): The energy production for the hour (kWh).
+        battery_state (dict): The current state of the battery.
+        config (dict): The battery configuration.
+        total_price_incl_vat_production (float): The energy price for production (including taxes).
+        timestamp (str): The timestamp for the current hour (format: YYYY-MM-DDTHH).
+        strategy (str): The battery charge strategy ("self-sufficiency" or "dynamic_cost_optimization").
+
+    Returns:
+        tuple: Adjusted consumption, adjusted production, updated battery state.
+    """
+    # Extract battery parameters from the config
+    battery_size = config["BATTERY_SIMULATION"]["BATTERY_SIZE_KWH"]
+    max_charging_rate = config["BATTERY_SIMULATION"]["MAX_CHARGING_RATE_KWH"]
+    max_discharging_rate = config["BATTERY_SIMULATION"]["MAX_DISCHARGING_RATE_KWH"]
+    round_trip_efficiency = config["BATTERY_SIMULATION"].get("ROUND_TRIP_EFFICIENCY", 0.96)
+    discharge_limit = (config["BATTERY_SIMULATION"].get("DISCHARGE_LIMIT_PERCENTAGE", 10) / 100) * battery_size
+
+    # Get the current battery level
+    battery_level = battery_state["level"]
+
+    # Initialize charge/discharge tracking
+    charge_amount = 0
+    discharge_amount = 0
+
+    if strategy == "self-sufficiency":
+        # Self-Sufficiency Strategy
+        # Adjust production by charging the battery
+        if hourly_production > 0:
+            charge_amount = min(hourly_production, max_charging_rate, battery_size - battery_level)
+            if charge_amount > 0:
+                battery_level += charge_amount * round_trip_efficiency
+                hourly_production -= charge_amount
+
+        # Adjust consumption by discharging the battery
+        if hourly_consumption > 0:
+            discharge_amount = min(hourly_consumption, max_discharging_rate, battery_level - discharge_limit)
+            if discharge_amount > 0:
+                battery_level -= discharge_amount
+                hourly_consumption -= discharge_amount
+
+    elif strategy == "dynamic_cost_optimization":
+        # Dynamic Cost Optimization Strategy
+        # Charge the battery when prices are low
+        if total_price_incl_vat_production < config["BATTERY_SIMULATION"].get("DYNAMIC_PRICE_THRESHOLD_LOW", 0.10):
+            charge_amount = min(max_charging_rate, battery_size - battery_level)
+            if charge_amount > 0:
+                battery_level += charge_amount * round_trip_efficiency
+
+        # Discharge the battery when prices are high
+        elif total_price_incl_vat_production > config["BATTERY_SIMULATION"].get("DYNAMIC_PRICE_THRESHOLD_HIGH", 0.25):
+            discharge_amount = min(max_discharging_rate, battery_level - discharge_limit)
+            if discharge_amount > 0:
+                battery_level -= discharge_amount
+                hourly_consumption -= discharge_amount
+
+    # Update the battery state
+    battery_state["level"] = battery_level
+    battery_state["total_charged"] += charge_amount
+    battery_state["total_discharged"] += discharge_amount
+
+    return hourly_consumption, hourly_production, battery_state
+
 def calculate_costs(consumption_data, production_data, price_data):
-    """Calculate energy costs, income, and total consumption/production, with monthly breakdowns."""
+    """Calculate energy costs, income, and total consumption/production, with battery simulation."""
     costs = 0
     income = 0
     total_consumption = 0
     total_production = 0
 
+    # Battery simulation variables
+    battery_enabled = config["BATTERY_SIMULATION"]["ENABLE"]
+    battery_state = {
+        "level": config["BATTERY_SIMULATION"].get("DISCHARGE_LIMIT", 0.1) * config["BATTERY_SIMULATION"]["BATTERY_SIZE_KWH"],
+        "total_charged": 0,
+        "total_discharged": 0
+    }
+
+    # Get the battery charge strategy
+    strategy = config["BATTERY_SIMULATION"].get("BATTERY_CHARGE_STRATEGY", "self-sufficiency")
+
+
+    # Daily charge/discharge tracking
+    daily_discharge = {}
+    daily_charge = 0  # Track the total charge for the current day
+    daily_discharge_total = 0  # Track the total discharge for the current day
+    current_day = None
+
     # Monthly breakdowns
     monthly_breakdown = {}
+    battery_adjusted_costs = 0
+    battery_adjusted_income = 0
+    total_battery_consumption = 0
+    total_battery_production = 0
 
     # Convert START_DATE and END_DATE to datetime objects
     start_datetime = datetime.strptime(START_DATE, "%Y-%m-%d")
@@ -305,10 +395,19 @@ def calculate_costs(consumption_data, production_data, price_data):
         # Extract the timestamp and base price
         timestamp_str = price_entry["datum"]
         timestamp = datetime.strptime(timestamp_str, "%Y-%m-%dT%H")
+        day = timestamp.date()
 
         # Skip entries outside the start and end date range
         if not (start_datetime <= timestamp < end_datetime):
             continue
+
+        # Finalize the previous day's discharge totals
+        if current_day != day:
+            if current_day is not None and daily_discharge_total > 1:  # Only track days with more than 1 kWh discharged
+                daily_discharge[current_day] = daily_discharge_total
+            current_day = day
+            daily_charge = 0
+            daily_discharge_total = 0
 
         # Extract the base price (purchase price excluding VAT)
         purchase_price_excl_vat = float(price_entry["prijs_excl_belastingen"].replace(",", "."))
@@ -325,18 +424,42 @@ def calculate_costs(consumption_data, production_data, price_data):
         hourly_consumption = consumption_data.get(timestamp_str, 0)
         hourly_production = production_data.get(timestamp_str, 0)
 
+        # Original values (without battery adjustments)
+        original_hourly_consumption = hourly_consumption
+        original_hourly_production = hourly_production
+
         # Check if production should be stopped for negative prices
         if STOP_PRODUCTION_NEGATIVE_PRICES and total_price_incl_vat_production < 0:
             debug_print(f"Negative price detected at {timestamp_str}: {total_price_incl_vat_production:.2f}. Stopping production.")
             hourly_production = 0  # Stop production for this hour
 
-        # Accumulate total consumption and production
-        total_consumption += hourly_consumption
-        total_production += hourly_production
+        # Simulate battery behavior if enabled
+        if battery_enabled:
+            battery_consumption, battery_production, battery_state = simulate_battery(
+                hourly_consumption, hourly_production, battery_state, config, total_price_incl_vat_production, timestamp_str, strategy
+            )
+            # Track daily charge and discharge
+            daily_charge += battery_state["total_charged"]
+            daily_discharge_total += battery_state["total_discharged"]
+        else:
+            battery_consumption = hourly_consumption
+            battery_production = hourly_production
 
-        # Accumulate costs and income
-        costs += hourly_consumption * total_price_incl_vat_consumption
-        income += hourly_production * total_price_incl_vat_production
+        # Accumulate total consumption and production (original values)
+        total_consumption += original_hourly_consumption
+        total_production += original_hourly_production
+
+        # Accumulate costs and income (original values)
+        costs += original_hourly_consumption * total_price_incl_vat_consumption
+        income += original_hourly_production * total_price_incl_vat_production
+
+        # Accumulate battery-adjusted consumption and production
+        total_battery_consumption += battery_consumption
+        total_battery_production += battery_production
+
+        # Accumulate battery-adjusted costs and income
+        battery_adjusted_costs += battery_consumption * total_price_incl_vat_consumption
+        battery_adjusted_income += battery_production * total_price_incl_vat_production
 
         # Calculate the month key (e.g., "2024-12")
         month_key = timestamp.strftime("%Y-%m")
@@ -348,29 +471,43 @@ def calculate_costs(consumption_data, production_data, price_data):
                 "income": 0,
                 "consumption": 0,
                 "production": 0,
+                "battery_adjusted_costs": 0,
+                "battery_adjusted_income": 0,
                 "fixed_supply_costs": FIXED_SUPPLY_COSTS,
                 "transport_costs": TRANSPORT_COSTS,
                 "energy_tax_compensation": ENERGY_TAX_COMPENSATION
             }
 
         # Update monthly breakdown
-        monthly_breakdown[month_key]["costs"] += hourly_consumption * total_price_incl_vat_consumption
-        monthly_breakdown[month_key]["income"] += hourly_production * total_price_incl_vat_production
-        monthly_breakdown[month_key]["consumption"] += hourly_consumption
-        monthly_breakdown[month_key]["production"] += hourly_production
+        monthly_breakdown[month_key]["costs"] += original_hourly_consumption * total_price_incl_vat_consumption
+        monthly_breakdown[month_key]["income"] += original_hourly_production * total_price_incl_vat_production
+        monthly_breakdown[month_key]["consumption"] += original_hourly_consumption
+        monthly_breakdown[month_key]["production"] += original_hourly_production
+        monthly_breakdown[month_key]["battery_adjusted_costs"] += battery_consumption * total_price_incl_vat_consumption
+        monthly_breakdown[month_key]["battery_adjusted_income"] += battery_production * total_price_incl_vat_production
+
+    # Finalize daily discharge tracking for the last day
+    if current_day is not None and daily_discharge_total > 1:
+        daily_discharge[current_day] = daily_discharge_total
 
     # Add fixed monthly costs to the total costs
     for month, data in monthly_breakdown.items():
         data["costs"] += data["fixed_supply_costs"] + data["transport_costs"] + data["energy_tax_compensation"]
+        data["battery_adjusted_costs"] += data["fixed_supply_costs"] + data["transport_costs"] + data["energy_tax_compensation"]
         costs += data["fixed_supply_costs"] + data["transport_costs"] + data["energy_tax_compensation"]
+        battery_adjusted_costs += data["fixed_supply_costs"] + data["transport_costs"] + data["energy_tax_compensation"]
 
     # Debugging: Print the final totals
     debug_print(f"Total Costs: {costs}, Total Income: {income}")
+    debug_print(f"Battery-Adjusted Costs: {battery_adjusted_costs}, Battery-Adjusted Income: {battery_adjusted_income}")
     debug_print(f"Total Consumption: {total_consumption}, Total Production: {total_production}")
+    debug_print(f"Battery-Adjusted Consumption: {total_battery_consumption}, Battery-Adjusted Production: {total_battery_production}")
+    debug_print(f"Total Charged: {battery_state['total_charged']:.2f} kWh")
+    debug_print(f"Total Discharged: {battery_state['total_discharged']:.2f} kWh")
 
-    return costs, income, total_consumption, total_production, monthly_breakdown
+    return costs, income, total_consumption, total_production, monthly_breakdown, battery_adjusted_costs, battery_adjusted_income
 
-def write_results_to_csv(total_costs, total_income, total_consumption, total_production, monthly_breakdown):
+def write_results_to_csv(total_costs, total_income, total_consumption, total_production, monthly_breakdown, battery_adjusted_costs, battery_adjusted_income):
     """Write the results to a CSV file."""
     # Ensure the results folder exists
     results_folder = "results"
@@ -388,6 +525,8 @@ def write_results_to_csv(total_costs, total_income, total_consumption, total_pro
         writer.writerow(["Metric", "Value"])
         writer.writerow(["Total Costs (€)", f"{total_costs:.2f}"])
         writer.writerow(["Total Income (€)", f"{total_income:.2f}"])
+        writer.writerow(["Battery-Adjusted Costs (€)", f"{battery_adjusted_costs:.2f}"])
+        writer.writerow(["Battery-Adjusted Income (€)", f"{battery_adjusted_income:.2f}"])
         writer.writerow(["Total Consumption (kWh)", f"{total_consumption:.2f}"])
         writer.writerow(["Total Production (kWh)", f"{total_production:.2f}"])
 
@@ -401,24 +540,30 @@ def write_results_to_csv(total_costs, total_income, total_consumption, total_pro
             "Income (€)", 
             "Consumption (kWh)", 
             "Production (kWh)", 
+            "Battery-Adjusted Costs (€)", 
+            "Battery-Adjusted Income (€)", 
             "Fixed Supply Costs (€)", 
             "Transport Costs (€)", 
             "Energy Tax Compensation (€)", 
-            "Net Monthly Costs (€)"  # New column for net monthly costs
+            "Net Monthly Costs (€)"
         ])
         for month, data in monthly_breakdown.items():
             # Calculate net monthly costs (costs - income)
             net_monthly_costs = data["costs"] - data["income"]
+            net_battery_monthly_costs = data["battery_adjusted_costs"] - data["battery_adjusted_income"]
             writer.writerow([
                 month,
                 f"{data['costs']:.2f}",
                 f"{data['income']:.2f}",
                 f"{data['consumption']:.2f}",
                 f"{data['production']:.2f}",
+                f"{data['battery_adjusted_costs']:.2f}",
+                f"{data['battery_adjusted_income']:.2f}",
                 f"{data['fixed_supply_costs']:.2f}",
                 f"{data['transport_costs']:.2f}",
                 f"{data['energy_tax_compensation']:.2f}",
-                f"{net_monthly_costs:.2f}"  # Write the net monthly costs
+                f"{net_monthly_costs:.2f}",
+                f"{net_battery_monthly_costs:.2f}"  # Include net costs with battery simulation
             ])
 
     print(f"Results written to {csv_filename}")
@@ -444,13 +589,28 @@ def main():
     # Fetch dynamic prices
     price_data = fetch_dynamic_prices(START_DATE, END_DATE)
 
-    # Calculate costs, income, and totals
-    total_costs, total_income, total_consumption, total_production, monthly_breakdown = calculate_costs(
-        consumption_data, production_data, price_data
-    )
+    # Calculate costs, income, and totals (with and without battery simulation)
+    (
+        total_costs,
+        total_income,
+        total_consumption,
+        total_production,
+        monthly_breakdown,
+        battery_adjusted_costs,
+        battery_adjusted_income
+    ) = calculate_costs(consumption_data, production_data, price_data)
 
     # Write results to a CSV file
-    write_results_to_csv(total_costs, total_income, total_consumption, total_production, monthly_breakdown)
+    write_results_to_csv(
+        total_costs,
+        total_income,
+        total_consumption,
+        total_production,
+        monthly_breakdown,
+        battery_adjusted_costs,
+        battery_adjusted_income
+    )
+
 
 if __name__ == "__main__":
     main()

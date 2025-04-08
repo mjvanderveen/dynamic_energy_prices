@@ -1,0 +1,4 @@
+pandas==1.5.3          # For data manipulation and analysis
+numpy==1.24.2          # For numerical operations
+requests==2.28.2       # For making HTTP requests to APIs
+python-dateutil==2.8.2 # For parsing and manipulating dates
