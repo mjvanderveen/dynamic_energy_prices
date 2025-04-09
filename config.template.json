@@ -1,6 +1,7 @@
 {
-    "HOME_ASSISTANT_API_URL": "http://<home_assistant_host>:<port>/api/history/period",
-    "HOME_ASSISTANT_API_TOKEN": "your_home_assistant_api_token_here",
+    "USE_EXPORT_JSON": true,   
+    "EXPORT_JSON_PATH": "data/export.json", 
+    "VICTORIAMETRICS_URL": "http://<victoriametrics_host>:<port>/api/v1/query_range",
     "DYNAMIC_PRICES_API_URL": "https://jeroen.nl/api/dynamische-energieprijzen",
     "DYNAMIC_PRICES_API_KEY": "your_dynamic_prices_api_key_here",
     "START_DATE": "YYYY-MM-DD",
@@ -13,7 +14,6 @@
         "sensor.energy_production_tarif_1_value",
         "sensor.energy_production_tarif_2_value"
     ],
-    "VICTORIAMETRICS_URL": "http://<victoriametrics_host>:<port>/api/v1/query_range",
     "TAXES": {
         "ENERGY_TAX": 0.102,
         "STORAGE_COSTS": 0.027,

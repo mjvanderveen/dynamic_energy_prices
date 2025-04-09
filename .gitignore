@@ -3,7 +3,10 @@ raw_consumption_data.json
 raw_production_data.json
 
 # Exclude the results folder
-results/*.csv
+results/*
+
+#Exclude the data folder
+data/*
 
 # Exclude the config.json file
 config.json

@@ -18,16 +18,51 @@ This project calculates energy costs and income based on dynamic energy prices, 
 Before running the script, you need to configure the `config.json` file. Below is an explanation of each setting:
 
 ### General Settings
-- **`HOME_ASSISTANT_API_URL`**: The URL of your Home Assistant API for fetching historical data.
-- **`HOME_ASSISTANT_API_TOKEN`**: The API token for authenticating with Home Assistant.
-- **`DYNAMIC_PRICES_API_URL`**: The URL of the dynamic energy prices API.
-- **`DYNAMIC_PRICES_API_KEY`**: The API key for accessing the dynamic energy prices API.
 - **`START_DATE`**: The start date for the analysis (format: `YYYY-MM-DD`).
 - **`END_DATE`**: The end date for the analysis (format: `YYYY-MM-DD`).
 
 ### Sensors
 - **`CONSUMPTION_SENSORS`**: A list of sensor IDs for energy consumption.
 - **`PRODUCTION_SENSORS`**: A list of sensor IDs for energy production.
+
+### Get the data
+
+## Victoria Metrics database on home assistant
+Configure the victoria metrics url in the config.json. The data will be downloaded automatically for the PRODUCTION_SENSORS and the CONSUMPTION_SENSORS
+
+- **`VICTORIAMETRICS_URL`**: "http://[home assistant ip]:8428/api/v1/query_range"
+
+#### Download from SQLite Database on Home Assistant
+
+Install the SQLite Web add-on and run the query below. Replace the sensor IDs to retrieve all sensor data required. These sensor names should be identical to the `CONSUMPTION_SENSORS` and `PRODUCTION_SENSORS` in the `config.json`.
+
+```sql
+SELECT 
+    statistic_id, 
+    DATETIME(start_ts, 'unixepoch', 'localtime') AS d, 
+    state AS value, 
+    state - LAG(state) OVER (PARTITION BY statistic_id ORDER BY start_ts) AS increment, 
+    [sum] AS total, 
+    unit_of_measurement 
+FROM 
+    statistics 
+INNER JOIN 
+    statistics_meta m 
+ON 
+    m.id = statistics.metadata_id 
+WHERE 
+    m.statistic_id IN (
+        'sensor.energy_consumption_tarif_1', 
+        'sensor.energy_consumption_tarif_2', 
+        'sensor.energy_production_tarif_1', 
+        'sensor.energy_production_tarif_2'
+    );```
+
+Then export the result as json and move it to the data folder as export.json
+
+### Dynamic Energy Prices
+- **`DYNAMIC_PRICES_API_URL`**: The URL of the dynamic energy prices API.
+- **`DYNAMIC_PRICES_API_KEY`**: The API key for accessing the dynamic energy 
 
 ### Taxes and Costs
 - **`ENERGY_TAX`**: Energy tax per kWh (in euro).

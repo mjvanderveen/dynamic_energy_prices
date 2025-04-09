@@ -16,8 +16,6 @@ with open(config_path, "r") as config_file:
     config = json.load(config_file)
 
 # Configuration variables
-HOME_ASSISTANT_API_URL = config["HOME_ASSISTANT_API_URL"]
-HOME_ASSISTANT_API_TOKEN = config["HOME_ASSISTANT_API_TOKEN"]
 DYNAMIC_PRICES_API_URL = config["DYNAMIC_PRICES_API_URL"]
 DYNAMIC_PRICES_API_KEY = config["DYNAMIC_PRICES_API_KEY"]
 START_DATE = config["START_DATE"]
@@ -47,139 +45,246 @@ def debug_print(message):
     if DEBUG:
         print(message)
 
+def fetch_sensor_data_from_json(file_path, start_date, end_date, sensor_ids, output_file=None):
+    """
+    Fetch and parse sensor data from a JSON file (export.json), filtering by sensor IDs and date range.
+
+    Args:
+        file_path (str): Path to the JSON file.
+        start_date (str): The start date for filtering data (format: YYYY-MM-DD).
+        end_date (str): The end date for filtering data (format: YYYY-MM-DD).
+        sensor_ids (list): List of sensor IDs to filter the data.
+        output_file (str): Path to save the raw filtered data as a CSV file (optional).
+
+    Returns:
+        dict: A dictionary with timestamps as keys and hourly sensor increments as values.
+    """
+    try:
+        # Load the JSON file
+        with open(file_path, "r") as file:
+            data = json.load(file)
+
+        # Convert start_date and end_date to datetime objects
+        start_datetime = datetime.strptime(start_date, "%Y-%m-%d")
+        end_datetime = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
+
+        # Initialize the filtered data list
+        filtered_data = []
+
+        # Process each sensor ID separately
+        for sensor_id in sensor_ids:
+            # Filter the data for the current sensor ID
+            sensor_data = [
+                record for record in data
+                if record["statistic_id"] == sensor_id
+                and start_datetime <= datetime.strptime(record["d"], "%Y-%m-%d %H:%M:%S") < end_datetime
+            ]
+
+            # Add the filtered data for the current sensor to the overall filtered data
+            filtered_data.extend(sensor_data)
+
+        # Debug: Print the number of records fetched
+        debug_print(f"Filtered {len(filtered_data)} records from {file_path} for sensors: {sensor_ids} within date range {start_date} to {end_date}")
+
+        # Save the raw filtered data to a CSV file if output_file is provided
+        if output_file:
+            try:
+                # Ensure the data folder exists
+                data_folder = os.path.join(script_dir, "data")
+                os.makedirs(data_folder, exist_ok=True)
+
+                # Construct the full path for the output file
+                output_file_path = os.path.join(data_folder, output_file)
+
+                # Write the filtered data to the CSV file
+                with open(output_file_path, mode="w", newline="") as csv_file:
+                    writer = csv.writer(csv_file)
+                    # Write the header
+                    writer.writerow(["statistic_id", "timestamp", "increment"])
+                    # Write the data
+                    for record in filtered_data:
+                        writer.writerow([record["statistic_id"], record["d"], record["increment"]])
+                debug_print(f"Raw filtered data written to {output_file_path}")
+            except IOError as e:
+                debug_print(f"Failed to write raw filtered data to {output_file}: {e}")
+
+        # Process the cumulative data
+        return process_cumulative_data(filtered_data, start_date, end_date, "d", "increment", "%Y-%m-%d %H:%M:%S")
+    except (IOError, json.JSONDecodeError) as e:
+        print(f"Error reading or parsing JSON file {file_path}: {e}")
+        return {}
+    
 def fetch_sensor_data_victoriametrics(sensor_ids, start_date, end_date, output_file):
-    """Fetch historical sensor data from VictoriaMetrics and save combined raw data to a JSON file."""
+    """
+    Fetch historical sensor data from VictoriaMetrics using the delta function to calculate increments.
+
+    Args:
+        sensor_ids (list): List of sensor IDs to query.
+        start_date (str): The start date for the query (format: YYYY-MM-DDT00:00:00Z).
+        end_date (str): The end date for the query (format: YYYY-MM-DDT23:59:59Z).
+        output_file (str): Path to save the combined raw data.
+
+    Returns:
+        dict: A dictionary with timestamps as keys and hourly sensor values as values.
+    """
     # Convert start_date and end_date to Unix timestamps (VictoriaMetrics requires this format)
-    start_timestamp = int(datetime.strptime(start_date, "%Y-%m-%dT%H:%M:%SZ").timestamp())
-    end_timestamp = int(datetime.strptime(end_date, "%Y-%m-%dT%H:%M:%SZ").timestamp())
+    start_datetime = datetime.strptime(start_date, "%Y-%m-%dT%H:%M:%SZ")
+    end_datetime = datetime.strptime(end_date, "%Y-%m-%dT%H:%M:%SZ")
+    start_timestamp = int(start_datetime.timestamp())
+    end_timestamp = int(end_datetime.timestamp())
 
     combined_data = []  # List to store combined raw data for all sensors
-    hourly_totals = {}  # Dictionary to store merged hourly totals
+    hourly_totals = {}  # Dictionary to store hourly increments
 
     for sensor_id in sensor_ids:
-        # Construct the PromQL query to include the last data point before the start date
-        query = f'{sensor_id}[1h]'
-
-        # Construct the request parameters
+        # Use the delta function in VictoriaMetrics to calculate increments
+        query = f'delta({sensor_id}_value[1h])'
         params = {
             "query": query,
-            "start": start_timestamp - 3600 * 24 * 30,  # Include one month before the start date
+            "start": start_timestamp,
             "end": end_timestamp,
-            "step": "3600s"  # Step size of 1 hour
+            "step": "3600s"
         }
 
-        # Print the query and parameters for debugging
-        debug_print(f"Testing query for {sensor_id}:")
-        debug_print(f"Query: {query}")
-        debug_print(f"Full URL: {VICTORIAMETRICS_URL}?{urllib.parse.urlencode(params)}")
-
-        # Make the request to the VictoriaMetrics API
         response = requests.get(VICTORIAMETRICS_URL, params=params)
 
-        # Check the response
         if response.status_code == 200:
-            # Parse the response and merge the data
-            parsed_data, original_totals = parse_victoriametrics_response_with_originals(
-                response.json(), start_date, end_date
-            )
-            debug_print(f"Number of items fetched for {sensor_id}: {len(parsed_data)}")  # Print the count of items
+            # Parse the response
+            raw_data = response.json().get("data", {}).get("result", [])
+            for result in raw_data:
+                for ts, val in result.get("values", []):
+                    # Convert the timestamp to UTC datetime
+                    utc_timestamp = datetime.utcfromtimestamp(int(ts))
 
-            # Combine parsed data into a single list
-            for timestamp, value in parsed_data.items():
-                combined_data.append({
-                    "timestamp": timestamp,
-                    "kWh": value,
-                    "total_kWh": original_totals.get(timestamp, 0),  # Add the original total kWh value
-                    "sensor": sensor_id
-                })
+                    # Calculate summer and winter time transitions
+                    year = utc_timestamp.year
 
-            # Merge parsed data into hourly_totals
-            for timestamp, value in parsed_data.items():
-                if timestamp not in hourly_totals:
-                    hourly_totals[timestamp] = 0
-                hourly_totals[timestamp] += value
+                    # Correct calculation for the last Sunday of March (DST Start)
+                    dst_start = (
+                        datetime(year, 4, 1) - timedelta(days=(datetime(year, 4, 1).weekday() + 1))
+                    ).replace(hour=2)  # DST starts at 02:00 AM CET
+
+                    # Correct calculation for the last Sunday of October (DST End)
+                    dst_end = (
+                        datetime(year, 11, 1) - timedelta(days=(datetime(year, 11, 1).weekday() + 1))
+                    ).replace(hour=3)  # DST ends at 03:00 AM CEST
+
+                    # Shift timestamps if they fall within DST
+                    if dst_start <= utc_timestamp < dst_end:
+                        adjusted_timestamp = utc_timestamp + timedelta(hours=1)
+                    else:
+                        adjusted_timestamp = utc_timestamp
+
+                    # Format the adjusted timestamp as YYYY-MM-DDTHH
+                    formatted_timestamp = adjusted_timestamp.strftime("%Y-%m-%dT%H")
+
+                    # Store the increment value
+                    increment = float(val)
+                    hourly_totals[formatted_timestamp] = increment
+
+                    # Add the raw data to combined_data
+                    combined_data.append({
+                        "statistic_id": sensor_id,
+                        "d": formatted_timestamp,
+                        "value": increment
+                    })
         else:
             debug_print(f"Failed to fetch data for {sensor_id}: {response.status_code}, {response.text}")
 
-    # Sort combined data by timestamp in ascending order
-    combined_data.sort(key=lambda x: x["timestamp"])
-
-    # Write combined data to a JSON file
+    # Save combined raw data to a JSON file
     try:
-        with open(output_file, "w") as file:
+        # Ensure the data folder exists
+        data_folder = os.path.join(script_dir, "data")
+        os.makedirs(data_folder, exist_ok=True)
+
+        # Construct the full path for the output file
+        output_file_path = os.path.join(data_folder, output_file)
+
+        # Write the combined data to the file
+        with open(output_file_path, "w") as file:
             json.dump(combined_data, file, indent=4)
-        debug_print(f"Combined raw data written to {output_file}")
+        debug_print(f"Combined raw data written to {output_file_path}")
     except IOError as e:
-        debug_print(f"Failed to write combined raw data to {output_file}: {e}")
+        debug_print(f"Failed to write combined raw data to {output_file_path}: {e}")
 
-    # Sort hourly_totals by timestamp (key) in ascending order
-    sorted_hourly_totals = dict(sorted(hourly_totals.items()))
-    return sorted_hourly_totals
+    return hourly_totals
 
-def parse_victoriametrics_response_with_originals(response_json, start_date, end_date):
-    """Parse the VictoriaMetrics response and calculate hourly differences, including one record before the start date."""
-    hourly_totals = {}
-    original_totals = {}
+def process_cumulative_data(data, start_date, end_date, timestamp_key, value_key, timestamp_format):
+    """
+    Process cumulative data to aggregate hourly values.
 
+    Args:
+        data (list): List of records containing hourly increments.
+        start_date (str): The start date for filtering data (format: YYYY-MM-DD).
+        end_date (str): The end date for filtering data (format: YYYY-MM-DD).
+        timestamp_key (str): The key in the record that contains the timestamp.
+        value_key (str): The key in the record that contains the increment value.
+        timestamp_format (str): The format of the timestamp in the data.
+
+    Returns:
+        dict: A dictionary with timestamps as keys and aggregated hourly values as values.
+    """
     # Convert start_date and end_date to datetime objects
-    start_datetime = datetime.strptime(start_date, "%Y-%m-%dT%H:%M:%SZ")
-    end_datetime = datetime.strptime(end_date, "%Y-%m-%dT%H:%M:%SZ")
+    start_datetime = datetime.strptime(start_date, "%Y-%m-%d")
+    end_datetime = datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)
 
-    try:
-        results = response_json.get("data", {}).get("result", [])
-        for result in results:
-            metric = result.get("metric", {})
-            values = result.get("values", [])  # List of [timestamp, value] pairs
+    # Initialize the result dictionary
+    hourly_totals = {}
 
-            # Track the previous value for this sensor
-            previous_value = 0
-            last_record_before_start = None
+    # Process each record in the data
+    for record in data:
+        try:
+            # Parse the timestamp and value
+            timestamp = datetime.strptime(record[timestamp_key], timestamp_format)
+            value = float(record[value_key])
 
-            for timestamp, value in values:
-                try:
-                    current_value = float(value)  # Convert value to float
-                    record_datetime = datetime.utcfromtimestamp(int(timestamp))
+            # Filter records within the specified date range
+            if start_datetime <= timestamp < end_datetime:
+                # Format the timestamp as YYYY-MM-DDTHH
+                formatted_timestamp = timestamp.strftime("%Y-%m-%dT%H")
 
-                    # Convert the timestamp to ISO format (YYYY-MM-DDTHH)
-                    hour_timestamp = record_datetime.strftime("%Y-%m-%dT%H")
+                # Aggregate the value
+                if formatted_timestamp not in hourly_totals:
+                    hourly_totals[formatted_timestamp] = 0
+                hourly_totals[formatted_timestamp] += value
+        except (KeyError, ValueError) as e:
+            debug_print(f"Skipping invalid record: {record}, Error: {e}")
 
-                    # Store the original cumulative kWh value
-                    original_totals[hour_timestamp] = current_value
+    return hourly_totals
 
-                    # Check if this record is before the start date
-                    if record_datetime < start_datetime:
-                        last_record_before_start = (hour_timestamp, current_value)
-                        continue
+def write_hourly_comparison_to_csv(victoriametrics_data, export_json_data, output_file):
+    """
+    Write a CSV file comparing hourly kWh data from VictoriaMetrics and export.json.
 
-                    # If we have a record before the start date, use it as the previous value
-                    if last_record_before_start:
-                        previous_value = last_record_before_start[1]
-                        last_record_before_start = None  # Reset after using it
+    Args:
+        victoriametrics_data (dict): Hourly kWh data from VictoriaMetrics.
+        export_json_data (dict): Hourly kWh data from export.json.
+        output_file (str): Path to save the comparison CSV file.
+    """
+    # Ensure the results folder exists
+    results_folder = "results"
+    os.makedirs(results_folder, exist_ok=True)
 
-                    # Calculate the hourly difference
-                    hourly_difference = max(0, current_value - previous_value)  # Ensure no negative values
-                    previous_value = current_value  # Update the previous value
+    # Construct the full path for the output file
+    output_file_path = os.path.join(results_folder, output_file)
 
-                    # Accumulate the hourly difference for this timestamp
-                    hourly_totals[hour_timestamp] = hourly_difference
-                except ValueError:
-                    continue  # Skip invalid values
-    except KeyError:
-        print("Unexpected response format from VictoriaMetrics")
+    # Get all unique timestamps from both data sources
+    all_timestamps = set(victoriametrics_data.keys()).union(set(export_json_data.keys()))
 
-    # Filter out records outside the start and end date range
-    filtered_hourly_totals = {
-        timestamp: value
-        for timestamp, value in hourly_totals.items()
-        if start_datetime <= datetime.strptime(timestamp, "%Y-%m-%dT%H") < end_datetime
-    }
-    filtered_original_totals = {
-        timestamp: value
-        for timestamp, value in original_totals.items()
-        if start_datetime <= datetime.strptime(timestamp, "%Y-%m-%dT%H") < end_datetime
-    }
+    # Write the comparison data to the CSV file
+    with open(output_file_path, mode="w", newline="") as csv_file:
+        writer = csv.writer(csv_file)
 
-    return filtered_hourly_totals, filtered_original_totals
+        # Write the header
+        writer.writerow(["Timestamp", "VictoriaMetrics (kWh)", "Export.json (kWh)"])
+
+        # Write the data for each timestamp
+        for timestamp in sorted(all_timestamps):
+            victoriametrics_value = victoriametrics_data.get(timestamp, 0)
+            export_json_value = export_json_data.get(timestamp, 0)
+            writer.writerow([timestamp, f"{victoriametrics_value:.3f}", f"{export_json_value:.3f}"])
+
+    print(f"Hourly comparison written to {output_file_path}")
 
 def fetch_dynamic_prices(start_date, end_date):
     """Fetch dynamic energy prices for the given date range, handling multiple years and caching."""
@@ -193,7 +298,7 @@ def fetch_dynamic_prices(start_date, end_date):
 
     # Loop through each year in the range
     for year in range(start_year, end_year + 1):
-        cache_file = f"./dynamic_energy_prices_{year}.json"  # Cache file for the year
+        cache_file = f"./data/dynamic_energy_prices_{year}.json"  # Cache file for the year
 
         # Determine if the year is in the past or the current year
         if year < current_date.year:
@@ -260,31 +365,6 @@ def normalize_price_data(price_data):
         except (KeyError, ValueError) as e:
             debug_print(f"Invalid price entry: {entry}, Error: {e}")
     return normalized_data
-
-def process_sensor_data(sensor_data):
-    """Process sensor data to calculate hourly totals."""
-    hourly_totals = {}
-
-    # The sensor_data is a list containing another list of records
-    for sensor_records in sensor_data:
-        for record in sensor_records:
-            # Skip records with invalid or unavailable states
-            try:
-                state = float(record.get("state", 0))  # Use .get() to avoid KeyError
-            except ValueError:
-                continue
-
-            # Extract the hour (YYYY-MM-DDTHH) from the last_changed timestamp
-            timestamp = record.get("last_changed", "")[:13]  # Ensure format matches price_data
-            if not timestamp:
-                continue
-
-            # Add the state to the hourly total
-            if timestamp not in hourly_totals:
-                hourly_totals[timestamp] = 0
-            hourly_totals[timestamp] += state
-
-    return hourly_totals
 
 def simulate_battery(hourly_consumption, hourly_production, battery_state, config, total_price_incl_vat_production, timestamp, strategy):
     """
@@ -498,12 +578,13 @@ def calculate_costs(consumption_data, production_data, price_data):
         battery_adjusted_costs += data["fixed_supply_costs"] + data["transport_costs"] + data["energy_tax_compensation"]
 
     # Debugging: Print the final totals
-    debug_print(f"Total Costs: {costs}, Total Income: {income}")
-    debug_print(f"Battery-Adjusted Costs: {battery_adjusted_costs}, Battery-Adjusted Income: {battery_adjusted_income}")
-    debug_print(f"Total Consumption: {total_consumption}, Total Production: {total_production}")
-    debug_print(f"Battery-Adjusted Consumption: {total_battery_consumption}, Battery-Adjusted Production: {total_battery_production}")
-    debug_print(f"Total Charged: {battery_state['total_charged']:.2f} kWh")
-    debug_print(f"Total Discharged: {battery_state['total_discharged']:.2f} kWh")
+    print(f"Total Costs: {costs}, Total Income: {income}")
+    print(f"Total Consumption: {total_consumption}, Total Production: {total_production}")
+    if battery_enabled:
+        print(f"Battery-Adjusted Costs: {battery_adjusted_costs}, Battery-Adjusted Income: {battery_adjusted_income}")
+        print(f"Battery-Adjusted Consumption: {total_battery_consumption}, Battery-Adjusted Production: {total_battery_production}")
+        print(f"Total Charged: {battery_state['total_charged']:.2f} kWh")
+        print(f"Total Discharged: {battery_state['total_discharged']:.2f} kWh")
 
     return costs, income, total_consumption, total_production, monthly_breakdown, battery_adjusted_costs, battery_adjusted_income
 
@@ -569,22 +650,31 @@ def write_results_to_csv(total_costs, total_income, total_consumption, total_pro
     print(f"Results written to {csv_filename}")
 
 def main():
-    # Fetch sensor data from VictoriaMetrics
+    # Fetch sensor data from export.json or VictoriaMetrics
+    use_export_json = config.get("USE_EXPORT_JSON", True)  # Default to using export.json
     sensor_start_date = f"{START_DATE}T00:00:00Z"
     sensor_end_date = f"{END_DATE}T23:59:59Z"
-    print(f"Fetching consumption data from VictoriaMetrics from {sensor_start_date} to {sensor_end_date}")
-    
-    # Fetch consumption data and save raw data to a JSON file
-    consumption_data = fetch_sensor_data_victoriametrics(
-        CONSUMPTION_SENSORS, sensor_start_date, sensor_end_date, "raw_consumption_data.json"
-    )
-    print("Consumption Data fetched and saved to raw_consumption_data.json.")
 
-    # Fetch production data and save raw data to a JSON file
-    production_data = fetch_sensor_data_victoriametrics(
-        PRODUCTION_SENSORS, sensor_start_date, sensor_end_date, "raw_production_data.json"
-    )
-    print("Production Data fetched and saved to raw_production_data.json.")
+    if use_export_json:
+        print("Fetching consumption data from export.json")
+        consumption_data = fetch_sensor_data_from_json(config.get("EXPORT_JSON_PATH", "data/export.json"), START_DATE, END_DATE, CONSUMPTION_SENSORS)
+        print("Consumption data fetched from export.json.")
+
+        print("Fetching production data from export.json")
+        production_data = fetch_sensor_data_from_json(config.get("EXPORT_JSON_PATH", "data/export.json"), START_DATE, END_DATE, PRODUCTION_SENSORS)
+        print("Production data fetched from export.json.")
+    else:
+        print(f"Fetching consumption data from VictoriaMetrics from {sensor_start_date} to {sensor_end_date}")
+        consumption_data = fetch_sensor_data_victoriametrics(
+            CONSUMPTION_SENSORS, sensor_start_date, sensor_end_date, "raw_consumption_data.json"
+        )
+        print("Consumption data fetched and saved to raw_consumption_data.json.")
+
+        print("Fetching production data from VictoriaMetrics")
+        production_data = fetch_sensor_data_victoriametrics(
+            PRODUCTION_SENSORS, sensor_start_date, sensor_end_date, "raw_production_data.json"
+        )
+        print("Production data fetched and saved to raw_production_data.json.")
 
     # Fetch dynamic prices
     price_data = fetch_dynamic_prices(START_DATE, END_DATE)
@@ -614,3 +704,17 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    """ sensor_start_date = f"{START_DATE}T00:00:00Z"
+    sensor_end_date = f"{END_DATE}T23:59:59Z"
+    production_data_json = fetch_sensor_data_from_json(config.get("EXPORT_JSON_PATH", "data/export.json"), START_DATE, END_DATE, PRODUCTION_SENSORS, output_file=config.get("RAW_PRODUCTION_DATA_SQLITE_CSV", "raw_production_data_sqlite_export.csv"))
+    production_data_victoriametrics = fetch_sensor_data_victoriametrics(
+            PRODUCTION_SENSORS, sensor_start_date, sensor_end_date, "raw_production_data.json"
+        )
+
+    # Write hourly comparison to CSV
+    write_hourly_comparison_to_csv(
+        victoriametrics_data=production_data_victoriametrics,  # Replace with actual VictoriaMetrics data
+        export_json_data=production_data_json,      # Replace with actual export.json data
+        output_file="hourly_comparison_production.csv"
+    ) """
