@@ -1,7 +1,3 @@
-# Exclude raw data JSON files
-raw_consumption_data.json
-raw_production_data.json
-
 # Exclude the results folder
 results/*
 

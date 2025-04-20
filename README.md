@@ -80,7 +80,8 @@ Then export the result as json and move it to the data folder as export.json
 - **`BATTERY_SIMULATION.MAX_CHARGING_RATE_KWH`**: The maximum charging rate of the battery in kWh per hour.
 - **`BATTERY_SIMULATION.MAX_DISCHARGING_RATE_KWH`**: The maximum discharging rate of the battery in kWh per hour.
 - **`BATTERY_SIMULATION.ROUND_TRIP_EFFICIENCY`**: The round-trip efficiency of the battery (e.g., `0.96` for 96% efficiency).
-- **`BATTERY_SIMULATION.DISCHARGE_LIMIT_PERCENTAGE`**: The minimum battery level as a percentage of total capacity (e.g., `10` for 10%).
+- **`BATTERY_SIMULATION.CHARGE_MAXIMUM_PERCENTAGE`**: The maximum battery level as a percentage of total capacity (e.g., `80` for 80%).
+- **`BATTERY_SIMULATION.DISCHARGE_MINIMUM_PERCENTAGE`**: The minimum battery level as a percentage of total capacity (e.g., `20` for 20%).
 
 ### Battery Charge Strategy
 - **`BATTERY_CHARGE_STRATEGY`**: The strategy for charging and discharging the battery. Options:
