@@ -10,7 +10,7 @@ config.json
 # Exclude workspace files
 *.code-workspace
 
-
+.github/*
 
 # General Python exclusions
 __pycache__/
