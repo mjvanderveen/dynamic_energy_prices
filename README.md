@@ -56,7 +56,8 @@ WHERE
         'sensor.energy_consumption_tarif_2', 
         'sensor.energy_production_tarif_1', 
         'sensor.energy_production_tarif_2'
-    );```
+    );
+```
 
 Then export the result as json and move it to the data folder as export.json
 
