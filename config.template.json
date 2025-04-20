@@ -25,6 +25,7 @@
     },
     "DEBUG": true,
     "STOP_PRODUCTION_NEGATIVE_PRICES": true,
+    "SALDEREN": false,
     "BATTERY_SIMULATION": {
         "ENABLE": true,
         "BATTERY_CHARGE_STRATEGY": "self-sufficiency",

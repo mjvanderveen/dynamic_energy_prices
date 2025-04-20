@@ -4,6 +4,9 @@ from datetime import datetime, timedelta
 import urllib.parse
 import os
 import csv
+import openpyxl
+from openpyxl.styles import Font
+from openpyxl.chart import BarChart, Reference
 
 # Get the directory of the current script
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -434,6 +437,40 @@ def simulate_battery(hourly_consumption, hourly_production, battery_state, confi
 
     return hourly_consumption, hourly_production, battery_state
 
+def calculate_hourly_energy_prices(base_price, total_annual_consumption, total_annual_production, cumulative_production, salderen):
+    """
+    Calculate the hourly energy prices for consumption and production.
+
+    Args:
+        base_price (float): The base energy price (€/kWh).
+        total_annual_consumption (float): Total annual consumption in kWh.
+        total_annual_production (float): Total annual production in kWh.
+        cumulative_production (float): Cumulative production up to the current hour in kWh.
+        salderen (bool): Whether salderen is enabled.
+
+    Returns:
+        tuple: (hourly_price_consumption, hourly_price_production)
+    """
+
+    # Calculate the hourly energy price for consumption
+    hourly_price_consumption = base_price + TAXES["STORAGE_COSTS"] + TAXES["ENERGY_TAX"]
+    hourly_price_consumption *= (1 + TAXES["VAT"] / 100)
+
+    # Calculate the hourly energy price for production
+    if salderen == False:
+        # If salderen is disabled, production price excludes energy tax and VAT for all hours
+        hourly_price_production = base_price + TAXES["STORAGE_COSTS_PRODUCTION"]
+    else:
+        if cumulative_production > total_annual_consumption:
+            # For excess production (above total annual consumption), exclude energy tax and VAT
+            hourly_price_production = base_price + TAXES["STORAGE_COSTS_PRODUCTION"]
+        else:
+            # For production within total annual consumption, include energy tax and VAT
+            hourly_price_production = base_price + TAXES["STORAGE_COSTS_PRODUCTION"] + TAXES["ENERGY_TAX"]
+            hourly_price_production *= (1 + TAXES["VAT"] / 100)
+    
+    return hourly_price_consumption, hourly_price_production
+
 def calculate_costs(consumption_data, production_data, price_data):
     """Calculate energy costs, income, and total consumption/production, with battery simulation."""
     costs = 0
@@ -452,94 +489,87 @@ def calculate_costs(consumption_data, production_data, price_data):
     # Get the battery charge strategy
     strategy = config["BATTERY_SIMULATION"].get("BATTERY_CHARGE_STRATEGY", "self-sufficiency")
 
-
-    # Daily charge/discharge tracking
-    daily_discharge = {}
-    daily_charge = 0  # Track the total charge for the current day
-    daily_discharge_total = 0  # Track the total discharge for the current day
-    current_day = None
-
     # Monthly breakdowns
     monthly_breakdown = {}
+    hourly_data = []  # List to store hourly data for the Excel file
     battery_adjusted_costs = 0
     battery_adjusted_income = 0
-    total_battery_consumption = 0
-    total_battery_production = 0
 
     # Convert START_DATE and END_DATE to datetime objects
     start_datetime = datetime.strptime(START_DATE, "%Y-%m-%d")
     end_datetime = datetime.strptime(END_DATE, "%Y-%m-%d") + timedelta(days=1)
 
-    debug_print("Debugging calculate_costs:")
+    # Calculate total annual consumption and production
+    total_annual_consumption = sum(consumption_data.values())
+    total_annual_production = sum(production_data.values())
+
+    # Initialize cumulative production
+    cumulative_production = 0
+
     for price_entry in price_data:
         # Extract the timestamp and base price
         timestamp_str = price_entry["datum"]
         timestamp = datetime.strptime(timestamp_str, "%Y-%m-%dT%H")
-        day = timestamp.date()
 
         # Skip entries outside the start and end date range
         if not (start_datetime <= timestamp < end_datetime):
             continue
 
-        # Finalize the previous day's discharge totals
-        if current_day != day:
-            if current_day is not None and daily_discharge_total > 1:  # Only track days with more than 1 kWh discharged
-                daily_discharge[current_day] = daily_discharge_total
-            current_day = day
-            daily_charge = 0
-            daily_discharge_total = 0
-
         # Extract the base price (purchase price excluding VAT)
-        purchase_price_excl_vat = float(price_entry["prijs_excl_belastingen"].replace(",", "."))
-
-        # Calculate the total price for consumption (including storage costs, energy tax, and VAT)
-        total_price_excl_vat_consumption = purchase_price_excl_vat + STORAGE_COSTS + ENERGY_TAX
-        total_price_incl_vat_consumption = total_price_excl_vat_consumption * (1 + VAT / 100)
-
-        # Calculate the total price for production (including storage costs for production)
-        total_price_excl_vat_production = purchase_price_excl_vat + ENERGY_TAX + STORAGE_COSTS_PRODUCTION
-        total_price_incl_vat_production = total_price_excl_vat_production * (1 + VAT / 100)
+        base_price = float(price_entry["prijs_excl_belastingen"].replace(",", "."))
 
         # Get hourly consumption and production values for the timestamp
         hourly_consumption = consumption_data.get(timestamp_str, 0)
         hourly_production = production_data.get(timestamp_str, 0)
 
-        # Original values (without battery adjustments)
-        original_hourly_consumption = hourly_consumption
-        original_hourly_production = hourly_production
+        # Update cumulative production
+        cumulative_production += hourly_production
 
-        # Check if production should be stopped for negative prices
-        if STOP_PRODUCTION_NEGATIVE_PRICES and total_price_incl_vat_production < 0:
-            debug_print(f"Negative price detected at {timestamp_str}: {total_price_incl_vat_production:.2f}. Stopping production.")
-            hourly_production = 0  # Stop production for this hour
+        # Calculate hourly energy prices
+        hourly_price_consumption, hourly_price_production = calculate_hourly_energy_prices(
+            base_price, total_annual_consumption, total_annual_production, cumulative_production, config["SALDEREN"]
+        )
+
+        # Adjust production if STOP_PRODUCTION_NEGATIVE_PRICES is enabled
+        adjusted_hourly_production = hourly_production
+        if STOP_PRODUCTION_NEGATIVE_PRICES and hourly_price_production < 0:
+            debug_print(f"Negative price detected at {timestamp_str}: {hourly_price_production:.2f}. Stopping production.")
+            adjusted_hourly_production = 0  # Stop production for this hour
 
         # Simulate battery behavior if enabled
         if battery_enabled:
             battery_consumption, battery_production, battery_state = simulate_battery(
-                hourly_consumption, hourly_production, battery_state, config, total_price_incl_vat_production, timestamp_str, strategy
+                hourly_consumption, adjusted_hourly_production, battery_state, config, hourly_price_production, timestamp_str, strategy
             )
-            # Track daily charge and discharge
-            daily_charge += battery_state["total_charged"]
-            daily_discharge_total += battery_state["total_discharged"]
         else:
             battery_consumption = hourly_consumption
-            battery_production = hourly_production
+            battery_production = adjusted_hourly_production
 
-        # Accumulate total consumption and production (original values)
-        total_consumption += original_hourly_consumption
-        total_production += original_hourly_production
+        # Accumulate total consumption and production (adjusted values)
+        total_consumption += hourly_consumption
+        total_production += adjusted_hourly_production
 
-        # Accumulate costs and income (original values)
-        costs += original_hourly_consumption * total_price_incl_vat_consumption
-        income += original_hourly_production * total_price_incl_vat_production
-
-        # Accumulate battery-adjusted consumption and production
-        total_battery_consumption += battery_consumption
-        total_battery_production += battery_production
+        # Accumulate costs and income (adjusted values)
+        costs += hourly_consumption * hourly_price_consumption
+        income += adjusted_hourly_production * hourly_price_production
 
         # Accumulate battery-adjusted costs and income
-        battery_adjusted_costs += battery_consumption * total_price_incl_vat_consumption
-        battery_adjusted_income += battery_production * total_price_incl_vat_production
+        battery_adjusted_costs += battery_consumption * hourly_price_consumption
+        battery_adjusted_income += battery_production * hourly_price_production
+
+        # Add hourly data for the Excel file
+        hourly_data.append({
+            "timestamp": timestamp_str,
+            "production": hourly_production,
+            "adjusted_production": adjusted_hourly_production,
+            "consumption": hourly_consumption,
+            "price_consumption": hourly_price_consumption,
+            "price_production": hourly_price_production,
+            "total_cost_or_income": (
+                adjusted_hourly_production * hourly_price_production -
+                hourly_consumption * hourly_price_consumption
+            )
+        })
 
         # Calculate the month key (e.g., "2024-12")
         month_key = timestamp.strftime("%Y-%m")
@@ -559,16 +589,12 @@ def calculate_costs(consumption_data, production_data, price_data):
             }
 
         # Update monthly breakdown
-        monthly_breakdown[month_key]["costs"] += original_hourly_consumption * total_price_incl_vat_consumption
-        monthly_breakdown[month_key]["income"] += original_hourly_production * total_price_incl_vat_production
-        monthly_breakdown[month_key]["consumption"] += original_hourly_consumption
-        monthly_breakdown[month_key]["production"] += original_hourly_production
-        monthly_breakdown[month_key]["battery_adjusted_costs"] += battery_consumption * total_price_incl_vat_consumption
-        monthly_breakdown[month_key]["battery_adjusted_income"] += battery_production * total_price_incl_vat_production
-
-    # Finalize daily discharge tracking for the last day
-    if current_day is not None and daily_discharge_total > 1:
-        daily_discharge[current_day] = daily_discharge_total
+        monthly_breakdown[month_key]["costs"] += hourly_consumption * hourly_price_consumption
+        monthly_breakdown[month_key]["income"] += adjusted_hourly_production * hourly_price_production
+        monthly_breakdown[month_key]["consumption"] += hourly_consumption
+        monthly_breakdown[month_key]["production"] += adjusted_hourly_production
+        monthly_breakdown[month_key]["battery_adjusted_costs"] += battery_consumption * hourly_price_consumption
+        monthly_breakdown[month_key]["battery_adjusted_income"] += battery_production * hourly_price_production
 
     # Add fixed monthly costs to the total costs
     for month, data in monthly_breakdown.items():
@@ -577,77 +603,186 @@ def calculate_costs(consumption_data, production_data, price_data):
         costs += data["fixed_supply_costs"] + data["transport_costs"] + data["energy_tax_compensation"]
         battery_adjusted_costs += data["fixed_supply_costs"] + data["transport_costs"] + data["energy_tax_compensation"]
 
-    # Debugging: Print the final totals
-    print(f"Total Costs: {costs}, Total Income: {income}")
-    print(f"Total Consumption: {total_consumption}, Total Production: {total_production}")
-    if battery_enabled:
-        print(f"Battery-Adjusted Costs: {battery_adjusted_costs}, Battery-Adjusted Income: {battery_adjusted_income}")
-        print(f"Battery-Adjusted Consumption: {total_battery_consumption}, Battery-Adjusted Production: {total_battery_production}")
-        print(f"Total Charged: {battery_state['total_charged']:.2f} kWh")
-        print(f"Total Discharged: {battery_state['total_discharged']:.2f} kWh")
+    return costs, income, total_consumption, total_production, monthly_breakdown, battery_adjusted_costs, battery_adjusted_income, hourly_data
 
-    return costs, income, total_consumption, total_production, monthly_breakdown, battery_adjusted_costs, battery_adjusted_income
+def write_results_to_excel(total_costs, total_income, total_consumption, total_production, monthly_breakdown, battery_adjusted_costs, battery_adjusted_income, hourly_data):
+    """
+    Write the results to an Excel file with three sheets: 'summary', 'monthly data', and 'hourly data'.
+    Add bar charts to the 'hourly data' sheet to show the distribution of energy prices.
+    """
+    # Create a new Excel workbook
+    workbook = openpyxl.Workbook()
 
-def write_results_to_csv(total_costs, total_income, total_consumption, total_production, monthly_breakdown, battery_adjusted_costs, battery_adjusted_income):
-    """Write the results to a CSV file."""
-    # Ensure the results folder exists
+    # Add the 'summary' sheet as the first sheet
+    summary_sheet = workbook.active
+    summary_sheet.title = "summary"
+
+    # Calculate additional metrics
+    difference_cost_income = total_costs - total_income
+
+    # Calculate average hourly price for consumption
+    total_weighted_price_consumption = sum(
+        record["consumption"] * record["price_consumption"] for record in hourly_data
+    )
+    average_price_consumption = (
+        total_weighted_price_consumption / total_consumption if total_consumption > 0 else 0
+    )
+
+    # Calculate average hourly price for production
+    total_weighted_price_production = sum(
+        record["production"] * record["price_production"] for record in hourly_data
+    )
+    average_price_production = (
+        total_weighted_price_production / total_production if total_production > 0 else 0
+    )
+
+    # Write the header for the 'summary' sheet
+    summary_sheet.append(["Metric", "Value"])
+    summary_sheet.append(["Total Costs (€)", total_costs])
+    summary_sheet.append(["Total Income (€)", total_income])
+    summary_sheet.append(["Difference (Costs - Income) (€)", difference_cost_income])
+    summary_sheet.append(["Battery-Adjusted Costs (€)", battery_adjusted_costs])
+    summary_sheet.append(["Battery-Adjusted Income (€)", battery_adjusted_income])
+    summary_sheet.append(["Total Consumption (kWh)", total_consumption])
+    summary_sheet.append(["Total Production (kWh)", total_production])
+    summary_sheet.append(["Average Price (Consumption €/kWh)", average_price_consumption])
+    summary_sheet.append(["Average Price (Production €/kWh)", average_price_production])
+
+    # Add the 'monthly data' sheet
+    monthly_sheet = workbook.create_sheet(title="monthly data")
+
+    # Write the header for the 'monthly data' sheet
+    monthly_sheet.append([
+        "Month", 
+        "Costs (€)", 
+        "Income (€)", 
+        "Consumption (kWh)", 
+        "Production (kWh)", 
+        "Battery-Adjusted Costs (€)", 
+        "Battery-Adjusted Income (€)", 
+        "Fixed Supply Costs (€)", 
+        "Transport Costs (€)", 
+        "Energy Tax Compensation (€)", 
+        "Net Monthly Costs (€)"
+    ])
+
+    # Write the monthly breakdown data
+    for month, data in monthly_breakdown.items():
+        net_monthly_costs = data["costs"] - data["income"]
+        monthly_sheet.append([
+            month,
+            data["costs"],
+            data["income"],
+            data["consumption"],
+            data["production"],
+            data["battery_adjusted_costs"],
+            data["battery_adjusted_income"],
+            data["fixed_supply_costs"],
+            data["transport_costs"],
+            data["energy_tax_compensation"],
+            net_monthly_costs
+        ])
+
+    # Add the 'hourly data' sheet
+    hourly_sheet = workbook.create_sheet(title="hourly data")
+
+    # Write the header for the 'hourly data' sheet
+    hourly_sheet.append([
+        "Date + Hour", 
+        "Production (kWh)", 
+        "Adjusted Production (kWh)", 
+        "Consumption (kWh)", 
+        "Hourly Energy Price (Consumption €/kWh)", 
+        "Hourly Energy Price (Production €/kWh)", 
+        "Total Cost/Income (€)"
+    ])
+
+    # Write the hourly data
+    for record in hourly_data:
+        hourly_sheet.append([
+            record["timestamp"],
+            record["production"],
+            record["adjusted_production"],
+            record["consumption"],
+            record["price_consumption"],
+            record["price_production"],
+            record["total_cost_or_income"]
+        ])
+
+    # Add the 'prices' sheet
+    prices_sheet = workbook.create_sheet(title="prices")
+
+    # Determine the range for energy prices dynamically
+    consumption_prices = [record["price_consumption"] for record in hourly_data]
+    production_prices = [record["price_production"] for record in hourly_data]
+
+    # Find the minimum and maximum prices across both consumption and production
+    min_price = min(min(consumption_prices), min(production_prices))
+    max_price = max(max(consumption_prices), max(production_prices))
+
+    # Create bins for energy prices (20 bins maximum)
+    num_bins = 20
+    bin_size = (max_price - min_price) / num_bins
+    bins = [min_price + i * bin_size for i in range(num_bins + 1)]
+
+    def bin_data(data, bins):
+        binned_data = [0] * (len(bins) - 1)
+        for value in data:
+            for i in range(len(bins) - 1):
+                if bins[i] <= value < bins[i + 1]:
+                    binned_data[i] += 1
+                    break
+        return binned_data
+
+    # Bin the data
+    binned_consumption = bin_data(consumption_prices, bins)
+    binned_production = bin_data(production_prices, bins)
+
+    # Write binned data to the 'prices' sheet
+    prices_sheet.append(["Price Range (Consumption)", "kWh Bought", "Price Range (Production)", "kWh Sold"])
+    for i in range(num_bins):
+        consumption_range = f"{bins[i]:.2f} - {bins[i + 1]:.2f}"
+        production_range = f"{bins[i]:.2f} - {bins[i + 1]:.2f}"
+        prices_sheet.append([
+            consumption_range,
+            binned_consumption[i],
+            production_range,
+            binned_production[i]
+        ])
+
+    # Create a bar chart for consumption
+    consumption_chart = BarChart()
+    consumption_chart.title = "Distribution of Energy Prices (Consumption)"
+    consumption_chart.x_axis.title = "Price Range (€/kWh)"
+    consumption_chart.y_axis.title = "kWh Bought"
+    consumption_data = Reference(prices_sheet, min_col=2, min_row=2, max_row=num_bins + 1)
+    consumption_categories = Reference(prices_sheet, min_col=1, min_row=2, max_row=num_bins + 1)
+    consumption_chart.add_data(consumption_data, titles_from_data=False)
+    consumption_chart.set_categories(consumption_categories)
+
+    # Position the consumption chart in column E
+    prices_sheet.add_chart(consumption_chart, "E2")
+
+    # Create a bar chart for production
+    production_chart = BarChart()
+    production_chart.title = "Distribution of Energy Prices (Production)"
+    production_chart.x_axis.title = "Price Range (€/kWh)"
+    production_chart.y_axis.title = "kWh Sold"
+    production_data = Reference(prices_sheet, min_col=4, min_row=2, max_row=num_bins + 1)
+    production_categories = Reference(prices_sheet, min_col=3, min_row=2, max_row=num_bins + 1)
+    production_chart.add_data(production_data, titles_from_data=False)
+    production_chart.set_categories(production_categories)
+
+    # Position the production chart in column E below the consumption chart
+    prices_sheet.add_chart(production_chart, "E20")
+
+    # Save the Excel file
     results_folder = "results"
     os.makedirs(results_folder, exist_ok=True)
+    excel_filename = os.path.join(results_folder, f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+    workbook.save(excel_filename)
 
-    # Create a timestamped filename
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    csv_filename = os.path.join(results_folder, f"results_{timestamp}.csv")
-
-    # Write the results to the CSV file
-    with open(csv_filename, mode="w", newline="") as csv_file:
-        writer = csv.writer(csv_file)
-
-        # Write the header
-        writer.writerow(["Metric", "Value"])
-        writer.writerow(["Total Costs (€)", f"{total_costs:.2f}"])
-        writer.writerow(["Total Income (€)", f"{total_income:.2f}"])
-        writer.writerow(["Battery-Adjusted Costs (€)", f"{battery_adjusted_costs:.2f}"])
-        writer.writerow(["Battery-Adjusted Income (€)", f"{battery_adjusted_income:.2f}"])
-        writer.writerow(["Total Consumption (kWh)", f"{total_consumption:.2f}"])
-        writer.writerow(["Total Production (kWh)", f"{total_production:.2f}"])
-
-        # Add a blank line
-        writer.writerow([])
-
-        # Write the monthly breakdown
-        writer.writerow([
-            "Month", 
-            "Costs (€)", 
-            "Income (€)", 
-            "Consumption (kWh)", 
-            "Production (kWh)", 
-            "Battery-Adjusted Costs (€)", 
-            "Battery-Adjusted Income (€)", 
-            "Fixed Supply Costs (€)", 
-            "Transport Costs (€)", 
-            "Energy Tax Compensation (€)", 
-            "Net Monthly Costs (€)"
-        ])
-        for month, data in monthly_breakdown.items():
-            # Calculate net monthly costs (costs - income)
-            net_monthly_costs = data["costs"] - data["income"]
-            net_battery_monthly_costs = data["battery_adjusted_costs"] - data["battery_adjusted_income"]
-            writer.writerow([
-                month,
-                f"{data['costs']:.2f}",
-                f"{data['income']:.2f}",
-                f"{data['consumption']:.2f}",
-                f"{data['production']:.2f}",
-                f"{data['battery_adjusted_costs']:.2f}",
-                f"{data['battery_adjusted_income']:.2f}",
-                f"{data['fixed_supply_costs']:.2f}",
-                f"{data['transport_costs']:.2f}",
-                f"{data['energy_tax_compensation']:.2f}",
-                f"{net_monthly_costs:.2f}",
-                f"{net_battery_monthly_costs:.2f}"  # Include net costs with battery simulation
-            ])
-
-    print(f"Results written to {csv_filename}")
+    print(f"Results written to {excel_filename}")
 
 def main():
     # Fetch sensor data from export.json or VictoriaMetrics
@@ -687,34 +822,22 @@ def main():
         total_production,
         monthly_breakdown,
         battery_adjusted_costs,
-        battery_adjusted_income
+        battery_adjusted_income,
+        hourly_data  # Use the hourly_data returned by calculate_costs
     ) = calculate_costs(consumption_data, production_data, price_data)
 
-    # Write results to a CSV file
-    write_results_to_csv(
+    # Write results to an Excel file
+    write_results_to_excel(
         total_costs,
         total_income,
         total_consumption,
         total_production,
         monthly_breakdown,
         battery_adjusted_costs,
-        battery_adjusted_income
+        battery_adjusted_income,
+        hourly_data
     )
 
 
 if __name__ == "__main__":
     main()
-
-    """ sensor_start_date = f"{START_DATE}T00:00:00Z"
-    sensor_end_date = f"{END_DATE}T23:59:59Z"
-    production_data_json = fetch_sensor_data_from_json(config.get("EXPORT_JSON_PATH", "data/export.json"), START_DATE, END_DATE, PRODUCTION_SENSORS, output_file=config.get("RAW_PRODUCTION_DATA_SQLITE_CSV", "raw_production_data_sqlite_export.csv"))
-    production_data_victoriametrics = fetch_sensor_data_victoriametrics(
-            PRODUCTION_SENSORS, sensor_start_date, sensor_end_date, "raw_production_data.json"
-        )
-
-    # Write hourly comparison to CSV
-    write_hourly_comparison_to_csv(
-        victoriametrics_data=production_data_victoriametrics,  # Replace with actual VictoriaMetrics data
-        export_json_data=production_data_json,      # Replace with actual export.json data
-        output_file="hourly_comparison_production.csv"
-    ) """
