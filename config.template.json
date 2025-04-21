@@ -1,18 +1,27 @@
 {
-    "USE_EXPORT_JSON": true,   
-    "EXPORT_JSON_PATH": "data/export.json", 
-    "VICTORIAMETRICS_URL": "http://<victoriametrics_host>:<port>/api/v1/query_range",
-    "DYNAMIC_PRICES_API_URL": "https://jeroen.nl/api/dynamische-energieprijzen",
-    "DYNAMIC_PRICES_API_KEY": "your_dynamic_prices_api_key_here",
-    "START_DATE": "YYYY-MM-DD",
-    "END_DATE": "YYYY-MM-DD",
+    "PARAMETERS": {
+        "START_DATE": "YYYY-MM-DD",  
+        "END_DATE": "YYYY-MM-DD",    
+        "STOP_PRODUCTION_NEGATIVE_PRICES": false,
+        "SALDEREN": true,
+        "DEBUG": true
+    },
+    "DATA": {
+        "USE_EXPORT_JSON": true,
+        "EXPORT_JSON_PATH": "data/export.json",
+        "RAW_PRODUCTION_DATA_SQLITE_CSV": "raw_production_data_sqlite_export.csv",
+        "RAW_CONSUMPTION_DATA_SQLITE_CSV": "raw_consumption_data_sqlite_export.csv",
+        "VICTORIAMETRICS_URL": "http://<homeassistant-ip>:8428/api/v1/query_range",
+        "DYNAMIC_PRICES_API_URL": "https://jeroen.nl/api/dynamische-energieprijzen", 
+        "DYNAMIC_PRICES_API_KEY": "<your-api-key>"
+        },
     "CONSUMPTION_SENSORS": [
-        "sensor.energy_consumption_tarif_1_value",
-        "sensor.energy_consumption_tarif_2_value"
+        "sensor.energy_consumption_tarif_1",
+        "sensor.energy_consumption_tarif_2"
     ],
     "PRODUCTION_SENSORS": [
-        "sensor.energy_production_tarif_1_value",
-        "sensor.energy_production_tarif_2_value"
+        "sensor.energy_production_tarif_1",
+        "sensor.energy_production_tarif_2"
     ],
     "TAXES": {
         "ENERGY_TAX": 0.102,
@@ -23,20 +32,18 @@
         "TRANSPORT_COSTS": 39.51,
         "ENERGY_TAX_COMPENSATION": -52.93
     },
-    "DEBUG": true,
-    "STOP_PRODUCTION_NEGATIVE_PRICES": true,
-    "SALDEREN": false,
     "BATTERY_SIMULATION": {
         "ENABLE": true,
         "BATTERY_CHARGE_STRATEGY": "self-sufficiency",
         "BATTERY_NAME": "Home Battery",
-        "BATTERY_SIZE_KWH": 10.0,
-        "MAX_CHARGING_RATE_KWH": 2.0,
-        "MAX_DISCHARGING_RATE_KWH": 2.0,
+        "BATTERY_SIZE_KWH": 5.1,
+        "BATTERY_PRICE": 2600,
+        "MAX_CHARGING_RATE_KWH": 5.7,
+        "MAX_DISCHARGING_RATE_KWH": 5.7,
         "ROUND_TRIP_EFFICIENCY": 0.8,
-        "DISCHARGE_MINIMUM_PERCENTAGE": 20,
-        "CHARGE_MAXIMUM_PERCENTAGE": 80, 
-        "DYNAMIC_PRICE_THRESHOLD_LOW": 0.15,
+        "DISCHARGE_MINIMUM_PERCENTAGE": 10,
+        "CHARGE_MAXIMUM_PERCENTAGE": 90,
+        "DYNAMIC_PRICE_THRESHOLD_LOW": 0.10,
         "DYNAMIC_PRICE_THRESHOLD_HIGH": 0.25
     }
 }

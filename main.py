@@ -7,6 +7,7 @@ import csv
 import openpyxl
 from openpyxl.styles import Font
 from openpyxl.chart import BarChart, Reference
+import random
 
 # Get the directory of the current script
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -19,13 +20,13 @@ with open(config_path, "r") as config_file:
     config = json.load(config_file)
 
 # Configuration variables
-DYNAMIC_PRICES_API_URL = config["DYNAMIC_PRICES_API_URL"]
-DYNAMIC_PRICES_API_KEY = config["DYNAMIC_PRICES_API_KEY"]
-START_DATE = config["START_DATE"]
-END_DATE = config["END_DATE"]
+DYNAMIC_PRICES_API_URL = config["DATA"]["DYNAMIC_PRICES_API_URL"]
+DYNAMIC_PRICES_API_KEY = config["DATA"]["DYNAMIC_PRICES_API_KEY"]
+START_DATE = config["PARAMETERS"]["START_DATE"]
+END_DATE = config["PARAMETERS"]["END_DATE"]
 CONSUMPTION_SENSORS = config["CONSUMPTION_SENSORS"]
 PRODUCTION_SENSORS = config["PRODUCTION_SENSORS"]
-VICTORIAMETRICS_URL = config["VICTORIAMETRICS_URL"]
+VICTORIAMETRICS_URL = config["DATA"]["VICTORIAMETRICS_URL"]
 
 # Load taxes
 TAXES = config["TAXES"]
@@ -38,11 +39,10 @@ TRANSPORT_COSTS = TAXES["TRANSPORT_COSTS"]  # Transport costs per month (in euro
 ENERGY_TAX_COMPENSATION = TAXES["ENERGY_TAX_COMPENSATION"]  # Energy tax compensation per month (in euro)
 
 # Load debug setting
-DEBUG = config.get("DEBUG", False)
+DEBUG = config["PARAMETERS"].get("DEBUG", False)
 
 # Load production stop setting
-STOP_PRODUCTION_NEGATIVE_PRICES = config.get("STOP_PRODUCTION_NEGATIVE_PRICES", False)
-
+STOP_PRODUCTION_NEGATIVE_PRICES = config["PARAMETERS"].get("STOP_PRODUCTION_NEGATIVE_PRICES", False)
 def debug_print(message):
     """Print debug messages if DEBUG is enabled."""
     if DEBUG:
@@ -369,7 +369,102 @@ def normalize_price_data(price_data):
             debug_print(f"Invalid price entry: {entry}, Error: {e}")
     return normalized_data
 
-def simulate_battery(hourly_consumption, hourly_production, battery_state, config, total_price_incl_vat_production, timestamp, strategy):
+def simulate_battery_with_forecasting(
+    hourly_consumption,
+    hourly_production,
+    battery_state,
+    config,
+    future_prices,
+    historical_consumption,
+    future_production_forecast,
+    timestamp
+):
+    """
+    Simulate the behavior of a battery using future price data and forecasting.
+
+    Args:
+        hourly_consumption (float): The energy consumption for the hour (kWh).
+        hourly_production (float): The energy production for the hour (kWh).
+        battery_state (dict): The current state of the battery.
+        config (dict): The battery configuration.
+        future_prices (list): Future price data for the next day.
+        historical_consumption (dict): Historical consumption data for forecasting.
+        future_production_forecast (dict): Forecasted production data for the next day.
+        timestamp (str): The timestamp for the current hour (format: YYYY-MM-DDTHH).
+
+    Returns:
+        tuple: Adjusted consumption, adjusted production, updated battery state, energy loss.
+    """
+    # Extract battery parameters from the config
+    battery_size = config["BATTERY_SIMULATION"]["BATTERY_SIZE_KWH"]
+    max_charging_rate = config["BATTERY_SIMULATION"]["MAX_CHARGING_RATE_KWH"]
+    max_discharging_rate = config["BATTERY_SIMULATION"]["MAX_DISCHARGING_RATE_KWH"]
+    round_trip_efficiency = config["BATTERY_SIMULATION"].get("ROUND_TRIP_EFFICIENCY", 0.8)
+    discharge_minimum = (config["BATTERY_SIMULATION"]["DISCHARGE_MINIMUM_PERCENTAGE"] / 100) * battery_size
+    charge_maximum = (config["BATTERY_SIMULATION"]["CHARGE_MAXIMUM_PERCENTAGE"] / 100) * battery_size
+    error_rate = config["BATTERY_SIMULATION"]["PRODUCTION_FORECAST_ERROR_RATE"] / 100
+
+    # Get the current battery level
+    battery_level = battery_state["level"]
+
+    # Initialize charge/discharge tracking
+    charge_amount = 0
+    discharge_amount = 0
+    energy_loss = 0  # Track energy loss due to round-trip efficiency
+    simulated_consumption = hourly_consumption
+    simulated_production = hourly_production
+
+    # Forecast high and low consumption hours using historical data
+    forecasted_high_consumption_hours = [
+        hour for hour, value in historical_consumption.items() if value > (sum(historical_consumption.values()) / len(historical_consumption))
+    ]
+
+    # Apply a random error rate to future production forecasts
+    forecasted_production = {
+        hour: value * (1 + random.uniform(-error_rate, error_rate))
+        for hour, value in future_production_forecast.items()
+    }
+
+    # Get the price for the current hour
+    current_price = future_prices.get(timestamp, {"price_consumption": 0, "price_production": 0})
+    price_consumption = current_price["price_consumption"]
+    price_production = current_price["price_production"]
+
+    # Case 1: Charge the battery if the price is low
+    if price_production < config["BATTERY_SIMULATION"]["DYNAMIC_PRICE_THRESHOLD_LOW"]:
+        charge_amount = min(max_charging_rate, charge_maximum - battery_level)
+        if charge_amount > 0:
+            battery_level += charge_amount * round_trip_efficiency
+            energy_loss += charge_amount * (1 - round_trip_efficiency)
+            battery_state["total_charged"] += charge_amount
+            simulated_production -= charge_amount  # Reduce production used for charging
+
+    # Case 2: Discharge the battery for consumption if the consumption price is high
+    elif timestamp in forecasted_high_consumption_hours and price_consumption > config["BATTERY_SIMULATION"]["DYNAMIC_PRICE_THRESHOLD_HIGH"]:
+        discharge_amount = min(hourly_consumption, max_discharging_rate, max(0, battery_level - discharge_minimum))
+        if discharge_amount > 0:
+            battery_level -= discharge_amount
+            simulated_consumption -= discharge_amount
+            battery_state["total_discharged"] += discharge_amount
+
+    # Case 3: Discharge the battery for production if the production price is high
+    elif price_production > config["BATTERY_SIMULATION"]["DYNAMIC_PRICE_THRESHOLD_HIGH"]:
+        discharge_amount = min(max_discharging_rate, max(0, battery_level - discharge_minimum))
+        if discharge_amount > 0:
+            battery_level -= discharge_amount
+            simulated_production += discharge_amount
+            battery_state["total_discharged"] += discharge_amount
+
+    # Update the battery state
+    battery_state["level"] = battery_level
+
+    # Calculate charge cycles
+    usable_capacity = charge_maximum - discharge_minimum
+    battery_state["charge_cycles"] = int(battery_state["total_discharged"] // usable_capacity)
+
+    return simulated_consumption, simulated_production, battery_state, energy_loss
+
+def simulate_battery(hourly_consumption, hourly_production, battery_state, config, total_price_incl_vat_production, total_price_incl_vat_consumption, timestamp, strategy):
     """
     Simulate the behavior of a battery for a single hour based on the chosen strategy.
 
@@ -428,28 +523,48 @@ def simulate_battery(hourly_consumption, hourly_production, battery_state, confi
             simulated_consumption = 0
 
     elif strategy == "dynamic_cost_optimization":
-        # Dynamic Cost Optimization Strategy
-        # Charge the battery when prices are low
+    # Dynamic Cost Optimization Strategy
+
+        # Case 1: Charge the battery if the price is below the low threshold
         if total_price_incl_vat_production < config["BATTERY_SIMULATION"].get("DYNAMIC_PRICE_THRESHOLD_LOW", 0.10):
             charge_amount = min(max_charging_rate, charge_maximum - battery_level)
             if charge_amount > 0:
                 battery_level += charge_amount * round_trip_efficiency
                 energy_loss += charge_amount * (1 - round_trip_efficiency)
                 battery_state["total_charged"] += charge_amount
+                simulated_production -= charge_amount  # Reduce production used for charging
 
-        # Discharge the battery when prices are high
-        elif total_price_incl_vat_production > config["BATTERY_SIMULATION"].get("DYNAMIC_PRICE_THRESHOLD_HIGH", 0.25):
-            discharge_amount = min(max_discharging_rate, battery_level - discharge_minimum)
-            if discharge_amount > 0:
-                battery_level -= discharge_amount
-                simulated_consumption -= discharge_amount
-                battery_state["total_discharged"] += discharge_amount
+            else:
+                # Case 2: Discharge the battery for consumption if the consumption price is very high
+                if hourly_consumption > 0 and total_price_incl_vat_consumption > config["BATTERY_SIMULATION"]["DYNAMIC_PRICE_THRESHOLD_HIGH"]:
+                    # Calculate the maximum discharge amount for consumption
+                    discharge_amount = min(hourly_consumption, max_discharging_rate, max(0, battery_level - discharge_minimum))
+                    if discharge_amount > 0:
+                        battery_level -= discharge_amount
+                        simulated_consumption -= discharge_amount
+                        battery_state["total_discharged"] += discharge_amount
 
-            # Handle excess discharge (net production scenario)
-            if simulated_consumption < 0:
-                simulated_production += abs(simulated_consumption)
-                simulated_consumption = 0
+                # Case 3: Discharge the battery for production if the production price is very high
+                if total_price_incl_vat_production > config["BATTERY_SIMULATION"]["DYNAMIC_PRICE_THRESHOLD_HIGH"]:
+                    # Calculate the maximum discharge amount for production
+                    discharge_amount = min(max_discharging_rate, max(0, battery_level - discharge_minimum))
+                    if discharge_amount > 0:
+                        battery_level -= discharge_amount
+                        simulated_production += discharge_amount
+                        battery_state["total_discharged"] += discharge_amount
 
+                # Handle excess discharge (net production scenario)
+                if simulated_consumption < 0:
+                    # Calculate the maximum allowable production based on the battery level
+                    max_allowable_production = max(0, battery_level - discharge_minimum)
+                    excess_consumption = abs(simulated_consumption)
+
+                    # Only allow production up to the maximum allowable production
+                    production_from_battery = min(excess_consumption, max_allowable_production)
+                    simulated_production += production_from_battery
+                    simulated_consumption += production_from_battery  # Reduce the excess consumption
+                    battery_level -= production_from_battery
+                    
     # Update the battery state
     battery_state["level"] = battery_level
 
@@ -551,7 +666,7 @@ def calculate_costs(consumption_data, production_data, price_data):
 
         # Calculate hourly energy prices
         hourly_price_consumption, hourly_price_production = calculate_hourly_energy_prices(
-            base_price, total_annual_consumption, total_annual_production, cumulative_production, config["SALDEREN"]
+            base_price, total_annual_consumption, total_annual_production, cumulative_production, config["PARAMETERS"]["SALDEREN"]
         )
 
         # Adjust production if STOP_PRODUCTION_NEGATIVE_PRICES is enabled
@@ -644,50 +759,127 @@ def calculate_costs(consumption_data, production_data, price_data):
 
 def write_results_to_excel(total_costs, total_income, total_consumption, total_production, monthly_breakdown, battery_adjusted_costs, battery_adjusted_income, hourly_data, total_energy_loss, total_charged, total_discharged, charge_cycles):
     """
-    Write the results to an Excel file with three sheets: 'summary', 'monthly data', and 'hourly data'.
-    Add bar charts to the 'hourly data' sheet to show the distribution of energy prices.
+    Write the results to an Excel file with multiple sheets: 'settings', 'summary', 'monthly data', and 'hourly data'.
     """
     # Create a new Excel workbook
     workbook = openpyxl.Workbook()
 
-    # Add the 'summary' sheet as the first sheet
-    summary_sheet = workbook.active
-    summary_sheet.title = "summary"
+    # Add the 'settings' sheet as the first sheet
+    settings_sheet = workbook.active
+    settings_sheet.title = "settings"
 
-    # Calculate additional metrics
-    difference_cost_income = total_costs - total_income
+    # Write the settings to the 'settings' sheet
+    settings_sheet.append(["Setting", "Value"])
+    for key, value in config.items():
+        if key == "DATA":
+            continue  # Skip the DATA section
+        if isinstance(value, dict):
+            for sub_key, sub_value in value.items():
+                if isinstance(sub_value, (list, dict)):
+                    sub_value = json.dumps(sub_value)  # Convert to JSON string for readability
+                settings_sheet.append([f"{key}.{sub_key}", sub_value])
+        else:
+            if isinstance(value, (list, dict)):
+                value = json.dumps(value)  # Convert to JSON string for readability
+            settings_sheet.append([key, value])
 
-    # Calculate average hourly price for consumption
-    total_weighted_price_consumption = sum(
-        record["consumption"] * record["price_consumption"] for record in hourly_data
-    )
-    average_price_consumption = (
-        total_weighted_price_consumption / total_consumption if total_consumption > 0 else 0
-    )
+    # Adjust column widths for the 'settings' sheet
+    for column in settings_sheet.columns:
+        max_length = 0
+        column_letter = column[0].column_letter  # Get the column letter
+        for cell in column:
+            try:
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+            except:
+                pass
+        settings_sheet.column_dimensions[column_letter].width = max_length + 2  # Add padding
 
-    # Calculate average hourly price for production
-    total_weighted_price_production = sum(
-        record["production"] * record["price_production"] for record in hourly_data
-    )
-    average_price_production = (
-        total_weighted_price_production / total_production if total_production > 0 else 0
-    )
+    # Add the 'summary' sheet explicitly
+    summary_sheet = workbook.create_sheet(title="summary")
 
     # Write the header for the 'summary' sheet
-    summary_sheet.append(["Metric", "Value"])
-    summary_sheet.append(["Total Costs (€)", total_costs])
-    summary_sheet.append(["Total Income (€)", total_income])
-    summary_sheet.append(["Difference (Costs - Income) (€)", difference_cost_income])
-    summary_sheet.append(["Battery-Adjusted Costs (€)", battery_adjusted_costs])
-    summary_sheet.append(["Battery-Adjusted Income (€)", battery_adjusted_income])
-    summary_sheet.append(["Total Consumption (kWh)", total_consumption])
-    summary_sheet.append(["Total Production (kWh)", total_production])
-    summary_sheet.append(["Average Price (Consumption €/kWh)", average_price_consumption])
-    summary_sheet.append(["Average Price (Production €/kWh)", average_price_production])
-    summary_sheet.append(["Total Energy Loss (kWh)", total_energy_loss])  # Add energy loss
-    summary_sheet.append(["Total kWh Charged by Battery", total_charged])  # Add total charged
-    summary_sheet.append(["Total kWh Discharged by Battery", total_discharged])  # Add total discharged
-    summary_sheet.append(["Number of Charge Cycles", charge_cycles])  # Add charge cycles
+    summary_sheet.append(["Without Battery", "Value", "", "With Battery", "Value"])
+
+    # Calculate total simulated consumption and production for battery data
+    total_simulated_consumption = sum(record["simulated_consumption"] for record in hourly_data if record["simulated_consumption"] is not None)
+    total_simulated_production = sum(record["simulated_production"] for record in hourly_data if record["simulated_production"] is not None)
+
+    # Calculate the time period in years
+    start_date = datetime.strptime(config["PARAMETERS"]["START_DATE"], "%Y-%m-%d")
+    end_date = datetime.strptime(config["PARAMETERS"]["END_DATE"], "%Y-%m-%d")
+    time_period_years = (end_date - start_date).days / 365.0
+
+    # Calculate the annual savings
+    final_cost_non_battery = total_costs - total_income
+    final_cost_battery = battery_adjusted_costs - battery_adjusted_income
+    annual_savings = (final_cost_non_battery - final_cost_battery) / time_period_years
+
+    # Calculate the payback period for the battery
+    battery_price = config["BATTERY_SIMULATION"]["BATTERY_PRICE"]
+    payback_period_years = battery_price / annual_savings if annual_savings > 0 else float('inf')
+
+    # Calculate weighted average hourly energy prices
+    weighted_avg_price_consumption_non_battery = sum(
+        record["price_consumption"] * record["consumption"] for record in hourly_data if record["consumption"] > 0
+    ) / total_consumption
+
+    weighted_avg_price_production_non_battery = sum(
+        record["price_production"] * record["production"] for record in hourly_data if record["production"] > 0
+    ) / total_production
+
+    weighted_avg_price_consumption_battery = sum(
+        record["price_consumption"] * record["simulated_consumption"] for record in hourly_data if record["simulated_consumption"] > 0
+    ) / total_simulated_consumption
+
+    weighted_avg_price_production_battery = sum(
+        record["price_production"] * record["simulated_production"] for record in hourly_data if record["simulated_production"] > 0
+    ) / total_simulated_production
+
+    # Define the data for both sections
+    non_battery_data = [
+        ["Total Costs (€)", total_costs],
+        ["Total Income (€)", total_income],
+        ["Final Annual Cost (€)", final_cost_non_battery],
+        ["Total Consumption (kWh)", total_consumption],
+        ["Total Production (kWh)", total_production],
+        ["Weighted Avg Price (Consumption €/kWh)", round(weighted_avg_price_consumption_non_battery, 4)],
+        ["Weighted Avg Price (Production €/kWh)", round(weighted_avg_price_production_non_battery, 4)]
+    ]
+
+    battery_data = [
+        ["Total Costs (€)", battery_adjusted_costs],
+        ["Total Income (€)", battery_adjusted_income],
+        ["Final Annual Cost (€)", final_cost_battery],
+        ["Total Consumption (kWh)", total_simulated_consumption],
+        ["Total Production (kWh)", total_simulated_production],
+        ["Weighted Avg Price (Consumption €/kWh)", round(weighted_avg_price_consumption_battery, 4)],
+        ["Weighted Avg Price (Production €/kWh)", round(weighted_avg_price_production_battery, 4)],
+        ["Total Energy Loss (kWh)", total_energy_loss],
+        ["Total kWh Charged by Battery", total_charged],
+        ["Total kWh Discharged by Battery", total_discharged],
+        ["Number of Charge Cycles", charge_cycles],
+        ["Payback Period (Years)", round(payback_period_years, 2)]
+    ]
+
+    # Write the data side by side with an empty column in between
+    for i in range(max(len(non_battery_data), len(battery_data))):
+        non_battery_row = non_battery_data[i] if i < len(non_battery_data) else ["", ""]
+        battery_row = battery_data[i] if i < len(battery_data) else ["", ""]
+        summary_sheet.append([non_battery_row[0], non_battery_row[1], "", battery_row[0], battery_row[1]])
+
+    # Adjust column widths for the 'summary' sheet
+    for column in summary_sheet.columns:
+        max_length = 0
+        column_letter = column[0].column_letter
+        for cell in column:
+            try:
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+            except:
+                pass
+        summary_sheet.column_dimensions[column_letter].width = max_length + 2
+                                
     # Add the 'monthly data' sheet
     monthly_sheet = workbook.create_sheet(title="monthly data")
 
@@ -722,6 +914,19 @@ def write_results_to_excel(total_costs, total_income, total_consumption, total_p
             data["energy_tax_compensation"],
             net_monthly_costs
         ])
+
+    # Adjust column widths for the 'monthly data' sheet
+    for column in monthly_sheet.columns:
+        max_length = 0
+        column_letter = column[0].column_letter
+        for cell in column:
+            try:
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+            except:
+                pass
+        monthly_sheet.column_dimensions[column_letter].width = max_length + 2
+
 
     # Add the 'hourly data' sheet
     hourly_sheet = workbook.create_sheet(title="hourly data")
@@ -766,6 +971,19 @@ def write_results_to_excel(total_costs, total_income, total_consumption, total_p
                 record["production_adjusted"]
             ])
         hourly_sheet.append(row)
+
+    # Adjust column widths for the 'hourly data' sheet
+    for column in hourly_sheet.columns:
+        max_length = 0
+        column_letter = column[0].column_letter
+        for cell in column:
+            try:
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+            except:
+                pass
+        hourly_sheet.column_dimensions[column_letter].width = max_length + 2
+
 
     # Add the 'prices' sheet
     prices_sheet = workbook.create_sheet(title="prices")
@@ -834,27 +1052,34 @@ def write_results_to_excel(total_costs, total_income, total_consumption, total_p
     # Position the production chart in column E below the consumption chart
     prices_sheet.add_chart(production_chart, "E20")
 
+    # Generate a human-readable file name
+    year = config["PARAMETERS"]["START_DATE"].split("-")[0]  # Extract the year from the start date
+    datetime_now = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")  # Current date and time
+    salderen = "yes" if config["PARAMETERS"].get("SALDEREN", False) else "no"
+    battery_size = config["BATTERY_SIMULATION"]["BATTERY_SIZE_KWH"] if config["BATTERY_SIMULATION"]["ENABLE"] else "no-battery"
+    file_name = f"{year}_salderen_{salderen}_battery_{battery_size}kWh_{datetime_now}.xlsx"
+
     # Save the Excel file
     results_folder = "results"
     os.makedirs(results_folder, exist_ok=True)
-    excel_filename = os.path.join(results_folder, f"results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
+    excel_filename = os.path.join(results_folder, file_name)
     workbook.save(excel_filename)
 
     print(f"Results written to {excel_filename}")
 
 def main():
     # Fetch sensor data from export.json or VictoriaMetrics
-    use_export_json = config.get("USE_EXPORT_JSON", True)  # Default to using export.json
+    use_export_json = config["DATA"].get("USE_EXPORT_JSON", True)  # Default to using export.json
     sensor_start_date = f"{START_DATE}T00:00:00Z"
     sensor_end_date = f"{END_DATE}T23:59:59Z"
 
     if use_export_json:
         print("Fetching consumption data from export.json")
-        consumption_data = fetch_sensor_data_from_json(config.get("EXPORT_JSON_PATH", "data/export.json"), START_DATE, END_DATE, CONSUMPTION_SENSORS)
+        consumption_data = fetch_sensor_data_from_json(config["DATA"].get("EXPORT_JSON_PATH", "data/export.json"), START_DATE, END_DATE, CONSUMPTION_SENSORS)
         print("Consumption data fetched from export.json.")
 
         print("Fetching production data from export.json")
-        production_data = fetch_sensor_data_from_json(config.get("EXPORT_JSON_PATH", "data/export.json"), START_DATE, END_DATE, PRODUCTION_SENSORS)
+        production_data = fetch_sensor_data_from_json(config["DATA"].get("EXPORT_JSON_PATH", "data/export.json"), START_DATE, END_DATE, PRODUCTION_SENSORS)
         print("Production data fetched from export.json.")
     else:
         print(f"Fetching consumption data from VictoriaMetrics from {sensor_start_date} to {sensor_end_date}")
