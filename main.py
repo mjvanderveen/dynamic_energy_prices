@@ -369,116 +369,9 @@ def normalize_price_data(price_data):
             debug_print(f"Invalid price entry: {entry}, Error: {e}")
     return normalized_data
 
-def simulate_battery_with_forecasting(
-    hourly_consumption,
-    hourly_production,
-    battery_state,
-    config,
-    future_prices,
-    historical_consumption,
-    future_production_forecast,
-    timestamp
-):
-    """
-    Simulate the behavior of a battery using future price data and forecasting.
-
-    Args:
-        hourly_consumption (float): The energy consumption for the hour (kWh).
-        hourly_production (float): The energy production for the hour (kWh).
-        battery_state (dict): The current state of the battery.
-        config (dict): The battery configuration.
-        future_prices (list): Future price data for the next day.
-        historical_consumption (dict): Historical consumption data for forecasting.
-        future_production_forecast (dict): Forecasted production data for the next day.
-        timestamp (str): The timestamp for the current hour (format: YYYY-MM-DDTHH).
-
-    Returns:
-        tuple: Adjusted consumption, adjusted production, updated battery state, energy loss.
-    """
-    # Extract battery parameters from the config
-    battery_size = config["BATTERY_SIMULATION"]["BATTERY_SIZE_KWH"]
-    max_charging_rate = config["BATTERY_SIMULATION"]["MAX_CHARGING_RATE_KWH"]
-    max_discharging_rate = config["BATTERY_SIMULATION"]["MAX_DISCHARGING_RATE_KWH"]
-    round_trip_efficiency = config["BATTERY_SIMULATION"].get("ROUND_TRIP_EFFICIENCY", 0.8)
-    discharge_minimum = (config["BATTERY_SIMULATION"]["DISCHARGE_MINIMUM_PERCENTAGE"] / 100) * battery_size
-    charge_maximum = (config["BATTERY_SIMULATION"]["CHARGE_MAXIMUM_PERCENTAGE"] / 100) * battery_size
-    error_rate = config["BATTERY_SIMULATION"]["PRODUCTION_FORECAST_ERROR_RATE"] / 100
-
-    # Get the current battery level
-    battery_level = battery_state["level"]
-
-    # Initialize charge/discharge tracking
-    charge_amount = 0
-    discharge_amount = 0
-    energy_loss = 0  # Track energy loss due to round-trip efficiency
-    simulated_consumption = hourly_consumption
-    simulated_production = hourly_production
-
-    # Forecast high and low consumption hours using historical data
-    forecasted_high_consumption_hours = [
-        hour for hour, value in historical_consumption.items() if value > (sum(historical_consumption.values()) / len(historical_consumption))
-    ]
-
-    # Apply a random error rate to future production forecasts
-    forecasted_production = {
-        hour: value * (1 + random.uniform(-error_rate, error_rate))
-        for hour, value in future_production_forecast.items()
-    }
-
-    # Get the price for the current hour
-    current_price = future_prices.get(timestamp, {"price_consumption": 0, "price_production": 0})
-    price_consumption = current_price["price_consumption"]
-    price_production = current_price["price_production"]
-
-    # Case 1: Charge the battery if the price is low
-    if price_production < config["BATTERY_SIMULATION"]["DYNAMIC_PRICE_THRESHOLD_LOW"]:
-        charge_amount = min(max_charging_rate, charge_maximum - battery_level)
-        if charge_amount > 0:
-            battery_level += charge_amount * round_trip_efficiency
-            energy_loss += charge_amount * (1 - round_trip_efficiency)
-            battery_state["total_charged"] += charge_amount
-            simulated_production -= charge_amount  # Reduce production used for charging
-
-    # Case 2: Discharge the battery for consumption if the consumption price is high
-    elif timestamp in forecasted_high_consumption_hours and price_consumption > config["BATTERY_SIMULATION"]["DYNAMIC_PRICE_THRESHOLD_HIGH"]:
-        discharge_amount = min(hourly_consumption, max_discharging_rate, max(0, battery_level - discharge_minimum))
-        if discharge_amount > 0:
-            battery_level -= discharge_amount
-            simulated_consumption -= discharge_amount
-            battery_state["total_discharged"] += discharge_amount
-
-    # Case 3: Discharge the battery for production if the production price is high
-    elif price_production > config["BATTERY_SIMULATION"]["DYNAMIC_PRICE_THRESHOLD_HIGH"]:
-        discharge_amount = min(max_discharging_rate, max(0, battery_level - discharge_minimum))
-        if discharge_amount > 0:
-            battery_level -= discharge_amount
-            simulated_production += discharge_amount
-            battery_state["total_discharged"] += discharge_amount
-
-    # Update the battery state
-    battery_state["level"] = battery_level
-
-    # Calculate charge cycles
-    usable_capacity = charge_maximum - discharge_minimum
-    battery_state["charge_cycles"] = int(battery_state["total_discharged"] // usable_capacity)
-
-    return simulated_consumption, simulated_production, battery_state, energy_loss
-
 def simulate_battery(hourly_consumption, hourly_production, battery_state, config, total_price_incl_vat_production, total_price_incl_vat_consumption, timestamp, strategy):
     """
     Simulate the behavior of a battery for a single hour based on the chosen strategy.
-
-    Args:
-        hourly_consumption (float): The energy consumption for the hour (kWh).
-        hourly_production (float): The energy production for the hour (kWh).
-        battery_state (dict): The current state of the battery.
-        config (dict): The battery configuration.
-        total_price_incl_vat_production (float): The energy price for production (including taxes).
-        timestamp (str): The timestamp for the current hour (format: YYYY-MM-DDTHH).
-        strategy (str): The battery charge strategy ("self-sufficiency" or "dynamic_cost_optimization").
-
-    Returns:
-        tuple: Adjusted consumption, adjusted production, updated battery state, energy loss.
     """
     # Extract battery parameters from the config
     battery_size = config["BATTERY_SIMULATION"]["BATTERY_SIZE_KWH"]
@@ -491,80 +384,97 @@ def simulate_battery(hourly_consumption, hourly_production, battery_state, confi
     # Get the current battery level
     battery_level = battery_state["level"]
 
-    # Initialize charge/discharge tracking
+    # Reset charge/discharge tracking for this hour
     charge_amount = 0
     discharge_amount = 0
+    battery_state["charge_amount"] = 0  # Reset charge amount
+    battery_state["discharge_amount"] = 0  # Reset discharge amount
     energy_loss = 0  # Track energy loss due to round-trip efficiency
     simulated_consumption = hourly_consumption
     simulated_production = hourly_production
 
     if strategy == "self-sufficiency":
-        # Self-Sufficiency Strategy
-        # Adjust production by charging the battery
-        if hourly_production > 0:
-            charge_amount = min(hourly_production, max_charging_rate, charge_maximum - battery_level)
-            if charge_amount > 0:
+    # Self-Sufficiency Strategy
+
+        net_consumption = max(0, hourly_consumption - hourly_production)
+        net_production = max(0, hourly_production - hourly_consumption)
+        
+        # Step 1: Use production to reduce consumption
+        if net_consumption > 0:
+            simulated_production = 0  # All production is used to offset consumption
+            simulated_consumption = net_consumption  # Remaining consumption after using production
+        else:
+            # No consumption, all production is available
+            simulated_consumption = 0
+            simulated_production = net_production  # All production is available for the grid
+
+        # Step 2: Charge the battery with remaining production
+        if net_production > 0:
+            charge_amount = min(net_production, max_charging_rate, charge_maximum - battery_level)
+            if charge_amount >= 0.1:  # Only charge if the amount is at least 0.1 kWh
                 battery_level += charge_amount * round_trip_efficiency
-                simulated_production -= charge_amount
                 energy_loss += charge_amount * (1 - round_trip_efficiency)
                 battery_state["total_charged"] += charge_amount
+                battery_state["charge_amount"] = charge_amount  # Update charge amount for this hour
+                net_production -= charge_amount  # Reduce net production by the amount charged
+                simulated_production = net_production  # Remaining production goes to the grid
 
-        # Adjust consumption by discharging the battery
-        if hourly_consumption > 0:
-            discharge_amount = min(hourly_consumption, max_discharging_rate, battery_level - discharge_minimum)
-            if discharge_amount > 0:
+        # Step 3: If there is no production, discharge the battery to meet consumption
+        elif net_consumption > 0:
+            discharge_amount = min(net_consumption, max_discharging_rate, max(0, battery_level - discharge_minimum))
+            if discharge_amount >= 0.1:  # Only discharge if the amount is at least 0.1 kWh
+                battery_level -= discharge_amount
+                battery_state["total_discharged"] += discharge_amount
+                battery_state["discharge_amount"] = discharge_amount  # Update discharge amount for this hour
+                net_consumption -= discharge_amount  # Reduce net consumption by the amount discharged
+                simulated_consumption = net_consumption
+                   
+    elif strategy == "dynamic_cost_optimization":
+        # Dynamic Cost Optimization Strategy
+
+        # Case 1: Charge the battery if the consumption price is below the low threshold
+        if total_price_incl_vat_consumption < config["BATTERY_SIMULATION"].get("DYNAMIC_PRICE_THRESHOLD_LOW", 0.10):
+            charge_amount = min(max_charging_rate, charge_maximum - battery_level)
+            if charge_amount >= 0.1:  # Only charge if the amount is at least 0.1 kWh
+                battery_level += charge_amount * round_trip_efficiency
+                energy_loss += charge_amount * (1 - round_trip_efficiency)
+                battery_state["total_charged"] += charge_amount
+                battery_state["charge_amount"] = charge_amount  # Update charge amount for this hour
+                simulated_consumption += charge_amount  # Increase simulated consumption for charging
+
+        # Case 2: Discharge the battery for consumption if the consumption price is very high
+        elif hourly_consumption > 0 and total_price_incl_vat_consumption > config["BATTERY_SIMULATION"]["DYNAMIC_PRICE_THRESHOLD_HIGH"]:
+            discharge_amount = min(hourly_consumption, max_discharging_rate, max(0, battery_level - discharge_minimum))
+            if discharge_amount >= 0.1:  # Only discharge if the amount is at least 0.1 kWh
                 battery_level -= discharge_amount
                 simulated_consumption -= discharge_amount
                 battery_state["total_discharged"] += discharge_amount
+                battery_state["discharge_amount"] = discharge_amount  # Update discharge amount for this hour
 
-        # Handle excess discharge (net production scenario)
-        if simulated_consumption < 0:
-            simulated_production += abs(simulated_consumption)
-            simulated_consumption = 0
+        # Case 3: Discharge the battery for production if the production price is very high
+        elif total_price_incl_vat_production > config["BATTERY_SIMULATION"]["DYNAMIC_PRICE_THRESHOLD_HIGH"]:
+            discharge_amount = min(max_discharging_rate, max(0, battery_level - discharge_minimum))
+            if discharge_amount >= 0.1:  # Only discharge if the amount is at least 0.1 kWh
+                battery_level -= discharge_amount
+                simulated_production += discharge_amount
+                battery_state["total_discharged"] += discharge_amount
+                battery_state["discharge_amount"] = discharge_amount  # Update discharge amount for this hour
 
-    elif strategy == "dynamic_cost_optimization":
-    # Dynamic Cost Optimization Strategy
-
-        # Case 1: Charge the battery if the price is below the low threshold
-        if total_price_incl_vat_production < config["BATTERY_SIMULATION"].get("DYNAMIC_PRICE_THRESHOLD_LOW", 0.10):
-            charge_amount = min(max_charging_rate, charge_maximum - battery_level)
-            if charge_amount > 0:
+        # Case 4: Charge the battery with solar production if the production price is not above the high threshold
+        if hourly_production > 0 and total_price_incl_vat_production <= config["BATTERY_SIMULATION"]["DYNAMIC_PRICE_THRESHOLD_HIGH"]:
+            charge_amount = min(hourly_production, max_charging_rate, charge_maximum - battery_level)
+            if charge_amount >= 0.1:  # Only charge if the amount is at least 0.1 kWh
                 battery_level += charge_amount * round_trip_efficiency
                 energy_loss += charge_amount * (1 - round_trip_efficiency)
                 battery_state["total_charged"] += charge_amount
-                simulated_production -= charge_amount  # Reduce production used for charging
+                battery_state["charge_amount"] = charge_amount  # Update charge amount for this hour
+                simulated_production = max(0, simulated_production - charge_amount)  # Ensure it doesn't go below 0
 
-            else:
-                # Case 2: Discharge the battery for consumption if the consumption price is very high
-                if hourly_consumption > 0 and total_price_incl_vat_consumption > config["BATTERY_SIMULATION"]["DYNAMIC_PRICE_THRESHOLD_HIGH"]:
-                    # Calculate the maximum discharge amount for consumption
-                    discharge_amount = min(hourly_consumption, max_discharging_rate, max(0, battery_level - discharge_minimum))
-                    if discharge_amount > 0:
-                        battery_level -= discharge_amount
-                        simulated_consumption -= discharge_amount
-                        battery_state["total_discharged"] += discharge_amount
-
-                # Case 3: Discharge the battery for production if the production price is very high
-                if total_price_incl_vat_production > config["BATTERY_SIMULATION"]["DYNAMIC_PRICE_THRESHOLD_HIGH"]:
-                    # Calculate the maximum discharge amount for production
-                    discharge_amount = min(max_discharging_rate, max(0, battery_level - discharge_minimum))
-                    if discharge_amount > 0:
-                        battery_level -= discharge_amount
-                        simulated_production += discharge_amount
-                        battery_state["total_discharged"] += discharge_amount
-
-                # Handle excess discharge (net production scenario)
-                if simulated_consumption < 0:
-                    # Calculate the maximum allowable production based on the battery level
-                    max_allowable_production = max(0, battery_level - discharge_minimum)
-                    excess_consumption = abs(simulated_consumption)
-
-                    # Only allow production up to the maximum allowable production
-                    production_from_battery = min(excess_consumption, max_allowable_production)
-                    simulated_production += production_from_battery
-                    simulated_consumption += production_from_battery  # Reduce the excess consumption
-                    battery_level -= production_from_battery
-                    
+            # Handle the remainder of the production if the battery is full
+            remainder_production = hourly_production - charge_amount
+            if remainder_production > 0:
+                simulated_production += remainder_production  # Return the remainder to the grid
+            
     # Update the battery state
     battery_state["level"] = battery_level
 
@@ -671,14 +581,22 @@ def calculate_costs(consumption_data, production_data, price_data):
 
         # Adjust production if STOP_PRODUCTION_NEGATIVE_PRICES is enabled
         adjusted_hourly_production = hourly_production
-        if STOP_PRODUCTION_NEGATIVE_PRICES and hourly_price_production < 0:
+        if STOP_PRODUCTION_NEGATIVE_PRICES and hourly_price_production < 0 and hourly_production > 0:
             debug_print(f"Negative price detected at {timestamp_str}: {hourly_price_production:.2f}. Stopping production.")
             adjusted_hourly_production = 0  # Stop production for this hour
 
         # Simulate battery behavior if enabled
         if battery_enabled:
+            # Use the original hourly_production for battery charging decisions
             battery_consumption, battery_production, battery_state, energy_loss = simulate_battery(
-                hourly_consumption, adjusted_hourly_production, battery_state, config, hourly_price_production, timestamp_str, strategy
+                hourly_consumption,
+                hourly_production,  # Use the original production value here
+                battery_state,
+                config,
+                hourly_price_production,
+                hourly_price_consumption,
+                timestamp_str,
+                strategy
             )
             total_energy_loss += energy_loss
             consumption_adjusted = battery_consumption != hourly_consumption
@@ -700,6 +618,8 @@ def calculate_costs(consumption_data, production_data, price_data):
         # Accumulate battery-adjusted costs and income
         battery_adjusted_costs += battery_consumption * hourly_price_consumption
         battery_adjusted_income += battery_production * hourly_price_production
+        
+        state_of_charge = (battery_state["level"] / config["BATTERY_SIMULATION"]["BATTERY_SIZE_KWH"]) * 100
 
         # Add hourly data for the Excel file
         hourly_data.append({
@@ -720,7 +640,10 @@ def calculate_costs(consumption_data, production_data, price_data):
             "battery_total_cost_or_income": (
                 battery_production * hourly_price_production -
                 battery_consumption * hourly_price_consumption
-            ) if battery_enabled else None
+            ) if battery_enabled else None,
+            "battery_charge": battery_state.get("charge_amount", 0),  # Add battery charge
+            "battery_discharge": battery_state.get("discharge_amount", 0),  # Add battery discharge
+            "state_of_charge": (battery_state["level"] / config["BATTERY_SIMULATION"]["BATTERY_SIZE_KWH"]) * 100  # Add SoC
         })
 
         # Calculate the month key (e.g., "2024-12")
@@ -828,13 +751,19 @@ def write_results_to_excel(total_costs, total_income, total_consumption, total_p
         record["price_production"] * record["production"] for record in hourly_data if record["production"] > 0
     ) / total_production
 
-    weighted_avg_price_consumption_battery = sum(
-        record["price_consumption"] * record["simulated_consumption"] for record in hourly_data if record["simulated_consumption"] > 0
-    ) / total_simulated_consumption
+    weighted_avg_price_consumption_battery = (
+        sum(record["price_consumption"] * record["simulated_consumption"] for record in hourly_data if record["simulated_consumption"] > 0)
+        / total_simulated_consumption
+        if total_simulated_consumption > 0
+        else 0
+    )
 
-    weighted_avg_price_production_battery = sum(
-        record["price_production"] * record["simulated_production"] for record in hourly_data if record["simulated_production"] > 0
-    ) / total_simulated_production
+    weighted_avg_price_production_battery = (
+        sum(record["price_production"] * record["simulated_production"] for record in hourly_data if record["simulated_production"] > 0)
+        / total_simulated_production
+        if total_simulated_production > 0
+        else 0
+    )
 
     # Define the data for both sections
     non_battery_data = [
@@ -939,20 +868,31 @@ def write_results_to_excel(total_costs, total_income, total_consumption, total_p
         "Consumption (kWh)", 
         "Hourly Energy Price (Consumption €/kWh)", 
         "Hourly Energy Price (Production €/kWh)", 
-        "Total Cost/Income (€)"
+        "Cost (Non-Battery)",  # New column for non-battery cost
+        "Income (Non-Battery)",  # New column for non-battery income
     ]
     if config["BATTERY_SIMULATION"]["ENABLE"]:
         header.extend([
+            "Cost (Battery)",  # New column for battery cost
+            "Income (Battery)",  # New column for battery income
             "Simulated Consumption (kWh)", 
             "Simulated Production (kWh)", 
-            "Battery-Adjusted Total Cost/Income (€)",
+            "Battery-Adjusted Total Cost/Income (€)",  # Keep for reference
             "Consumption Adjusted", 
-            "Production Adjusted"
+            "Production Adjusted",
+            "Battery Action",  # New column for battery action
+            "Battery kWh",     # New column for battery kWh
+            "State of Charge (%)"  # New column for SoC
         ])
     hourly_sheet.append(header)
 
     # Write the hourly data
     for record in hourly_data:
+        # Calculate non-battery cost and income
+        non_battery_cost = record["consumption"] * record["price_consumption"]
+        non_battery_income = record["adjusted_production"] * record["price_production"]
+
+        # Base row data
         row = [
             record["timestamp"],
             record["production"],
@@ -960,16 +900,47 @@ def write_results_to_excel(total_costs, total_income, total_consumption, total_p
             record["consumption"],
             record["price_consumption"],
             record["price_production"],
-            record["total_cost_or_income"]
+            round(non_battery_cost, 2),  # Add non-battery cost
+            round(non_battery_income, 2),  # Add non-battery income
         ]
+
         if config["BATTERY_SIMULATION"]["ENABLE"]:
+            # Calculate battery-adjusted cost and income
+            battery_cost = (
+                record["simulated_consumption"] * record["price_consumption"]
+                if record["simulated_consumption"] is not None
+                else 0
+            )
+            battery_income = (
+                record["simulated_production"] * record["price_production"]
+                if record["simulated_production"] is not None
+                else 0
+            )
+
+            # Determine battery action and kWh
+            battery_action = "Idle"
+            battery_kwh = 0
+            if record.get("battery_charge", 0) >= 0.1:
+                battery_action = "Charged"
+                battery_kwh = record["battery_charge"]
+            elif record.get("battery_discharge", 0) >= 0.1:
+                battery_action = "Discharged"
+                battery_kwh = record["battery_discharge"]
+
+            # Extend row with battery-related data
             row.extend([
+                round(battery_cost, 2),  # Add battery cost
+                round(battery_income, 2),  # Add battery income
                 record["simulated_consumption"],
                 record["simulated_production"],
-                record["battery_total_cost_or_income"],
+                record["battery_total_cost_or_income"],  # Keep for reference
                 record["consumption_adjusted"],
-                record["production_adjusted"]
+                record["production_adjusted"],
+                battery_action,  # Add battery action
+                battery_kwh,     # Add battery kWh
+                round(record["state_of_charge"], 2)  # Add SoC (rounded to 2 decimal places)
             ])
+
         hourly_sheet.append(row)
 
     # Adjust column widths for the 'hourly data' sheet
