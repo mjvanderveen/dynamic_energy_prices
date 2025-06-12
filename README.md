@@ -15,15 +15,27 @@ This project calculates energy costs and income based on dynamic energy prices, 
 
 ## Configuration
 
-Before running the script, you need to configure the `config.json` file. Below is an explanation of each setting:
+Before running the script, you need to configure the `config.json` file. Below is an explanation of each setting, with details based on the code in `main.py`:
 
-### General Settings
-- **`START_DATE`**: The start date for the analysis (format: `YYYY-MM-DD`).
-- **`END_DATE`**: The end date for the analysis (format: `YYYY-MM-DD`).
+### PARAMETERS
 
-### Sensors
-- **`CONSUMPTION_SENSORS`**: A list of sensor IDs for energy consumption.
-- **`PRODUCTION_SENSORS`**: A list of sensor IDs for energy production.
+- **`START_DATE`**: The start date for the analysis (format: `YYYY-MM-DD`). Used to filter all data and price queries.
+- **`END_DATE`**: The end date for the analysis (format: `YYYY-MM-DD`). Used to filter all data and price queries.
+- **`BASELOAD_CONSUMPTION`**: The minimum (base) consumption in kWh per hour. Used for filling gaps or as a fallback.
+- **`STOP_PRODUCTION_NEGATIVE_PRICES`**: If `true`, production is stopped (set to zero) during hours when the calculated price for production (including taxes) is negative.
+- **`SALDEREN`**: If `true`, enables net metering (salderen) logic for production prices.
+- **`DEBUG`**: If `true`, enables debug print statements throughout the script.
+
+### DATA
+
+- **`USE_EXPORT_JSON`**: If `true`, loads sensor data from a local export JSON file. If `false`, fetches data from VictoriaMetrics.
+- **`EXPORT_JSON_PATH`**: Path to the export JSON file (default: `data/export.json`).
+- **`RAW_PRODUCTION_DATA_SQLITE_CSV`**: Path to raw production data exported from SQLite (optional).
+- **`RAW_CONSUMPTION_DATA_SQLITE_CSV`**: Path to raw consumption data exported from SQLite (optional).
+- **`VICTORIAMETRICS_URL`**: URL for the VictoriaMetrics API (used if `USE_EXPORT_JSON` is `false`).
+- **`DYNAMIC_PRICES_API_URL`**: URL for the dynamic energy prices API.
+- **`DYNAMIC_PRICES_API_KEY`**: API key for accessing the dynamic energy prices API.
+
 
 ### Get the data
 
@@ -61,12 +73,60 @@ WHERE
 
 Then export the result as json and move it to the data folder as export.json
 
-### Dynamic Energy Prices
-- **`DYNAMIC_PRICES_API_URL`**: The URL of the dynamic energy prices API.
-- **`DYNAMIC_PRICES_API_KEY`**: The API key for accessing the dynamic energy 
+
+### Adding Consumption and Production Sensors
+
+You can add your consumption and production sensors as objects in the `CONSUMPTION_SENSORS` and `PRODUCTION_SENSORS` arrays. Each sensor object can have the following parameters:
+
+- **`name`**: A friendly name for the sensor.
+- **`sensor`**: The sensor ID as used in your Home Assistant or data source.
+- **`type`**: The type of sensor. Use `"counter"` for cumulative energy meters, `"gauge"` for instantaneous values.
+- **`data_gap_fill`**: How to fill missing data (e.g., `"1d"` for daily).
+- **`resets`** (optional): `"yes"` if the counter resets periodically.
+
+**Example:**
+```json
+"CONSUMPTION_SENSORS": [
+    { "name": "energy_consumption_tarif_1", "sensor": "sensor.energy_consumption_tarif_1", "type": "counter", "data_gap_fill": "1d"},
+    { "name": "energy_consumption_tarif_2", "sensor": "sensor.energy_consumption_tarif_2", "type": "counter", "data_gap_fill": "1d"}
+],
+"PRODUCTION_SENSORS": [
+    { "name": "energy_production_tarif_1", "sensor": "sensor.energy_production_tarif_1", "type": "counter", "data_gap_fill": "1d"},
+    { "name": "energy_production_tarif_2", "sensor": "sensor.energy_production_tarif_2", "type": "counter", "data_gap_fill": "1d"}   
+],
+```
+
+### Heatpump Settings
+
+To enable and configure smart heating for your heatpump, use the `HEATPUMP` object in your config. The main options are:
+
+- **`ENABLE_SMART_HEATING`**: Set to `true` to enable shifting heatpump consumption to cheaper hours.
+- **`STOP_HEATPUMP_ON_NUMBER_OF_MOST_EXPENSIVE_HOURS`**: Number of most expensive hours per day to stop the heatpump.
+- **`FULL_TIME_RUNNING_MINIMUM_THRESHOLD_BASED_ON_OUTSIDE_TEMPERATURE`**: Minimum outside temperature (°C) below which the heatpump always runs.
+- **`HEATPUMP_SENSORS`**: List of sensor objects for the heatpump. Each object can have:
+  - `name`: Friendly name (e.g., `"HEATPUMP_POWER_OUTPUT_SENSOR"`, `"HEATPUMP_CONSUMPTION_SENSOR"`, `"OUTSIDE_TEMPERATURE_SENSOR"`).
+  - `sensor`: The sensor ID.
+  - `type`: `"gauge"` or `"counter"`.
+  - `data_gap_fill`: How to fill missing data (e.g., `"1d"`).
+  - `resets`: `"yes"` if the counter resets (optional).
+
+**Example:**
+```json
+"HEATPUMP" : {
+    "ENABLE_SMART_HEATING": true,
+    "STOP_HEATPUMP_ON_NUMBER_OF_MOST_EXPENSIVE_HOURS": 4,
+    "FULL_TIME_RUNNING_MINIMUM_THRESHOLD_BASED_ON_OUTSIDE_TEMPERATURE": 0,
+    "HEATPUMP_SENSORS": [
+        { "name": "HEATPUMP_POWER_OUTPUT_SENSOR", "sensor": "sensor.boiler_compressor_power_output", "type": "gauge",  "data_gap_fill": "1d"},
+        { "name": "HEATPUMP_CONSUMPTION_SENSOR", "sensor": "sensor.daily_heatpump_energy_consumption", "type": "counter", "resets": "yes", "data_gap_fill": "1d"},
+        { "name": "OUTSIDE_TEMPERATURE_SENSOR", "sensor": "sensor.boiler_outside_temperature", "type": "gauge", "data_gap_fill": "1d"}
+    ]
+},
+```
 
 ### Taxes and Costs
-- **`ENERGY_TAX`**: Energy tax per kWh (in euro).
+
+- **`ENERGY_TAX`**: Energy tax per kWh (in euro). Used in price calculations for both consumption and production.
 - **`STORAGE_COSTS`**: Storage costs per kWh for consumption (in euro).
 - **`STORAGE_COSTS_PRODUCTION`**: Storage costs per kWh for production (in euro, typically negative).
 - **`VAT`**: VAT percentage applied to the total price.
@@ -75,24 +135,21 @@ Then export the result as json and move it to the data folder as export.json
 - **`ENERGY_TAX_COMPENSATION`**: Energy tax compensation per month (in euro, typically negative).
 
 ### Battery Simulation
-- **`BATTERY_SIMULATION.ENABLE`**: Set to `true` to enable battery simulation.
-- **`BATTERY_SIMULATION.BATTERY_SIZE_KWH`**: The total capacity of the battery in kWh.
-- **`BATTERY_SIMULATION.MAX_CHARGING_RATE_KWH`**: The maximum charging rate of the battery in kWh per hour.
-- **`BATTERY_SIMULATION.MAX_DISCHARGING_RATE_KWH`**: The maximum discharging rate of the battery in kWh per hour.
-- **`BATTERY_SIMULATION.ROUND_TRIP_EFFICIENCY`**: The round-trip efficiency of the battery (e.g., `0.96` for 96% efficiency).
-- **`BATTERY_SIMULATION.CHARGE_MAXIMUM_PERCENTAGE`**: The maximum battery level as a percentage of total capacity (e.g., `80` for 80%).
-- **`BATTERY_SIMULATION.DISCHARGE_MINIMUM_PERCENTAGE`**: The minimum battery level as a percentage of total capacity (e.g., `20` for 20%).
 
-### Battery Charge Strategy
-- **`BATTERY_CHARGE_STRATEGY`**: The strategy for charging and discharging the battery. Options:
+- **`BATTERY_SIMULATION.ENABLE`**: Set to `true` to enable battery simulation.
+- **`BATTERY_SIMULATION.BATTERY_CHARGE_STRATEGY`**: The strategy for charging and discharging the battery. Options:
   - `self-sufficiency`: The battery charges when there is excess production and discharges to meet consumption.
   - `dynamic_cost_optimization`: The battery charges when prices are low and discharges when prices are high.
-- **`DYNAMIC_PRICE_THRESHOLD_LOW`**: The price threshold (€/kWh) below which the battery will charge during the `dynamic_cost_optimization` strategy.
-- **`DYNAMIC_PRICE_THRESHOLD_HIGH`**: The price threshold (€/kWh) above which the battery will discharge during the `dynamic_cost_optimization` strategy.
-
-### Debugging and Features
-- **`DEBUG`**: Set to `true` to enable debug print statements.
-- **`STOP_PRODUCTION_NEGATIVE_PRICES`**: Set to `true` to stop production when energy prices (including taxes) are negative.
+- **`BATTERY_SIMULATION.BATTERY_NAME`**: Name of the battery (for reference).
+- **`BATTERY_SIMULATION.BATTERY_SIZE_KWH`**: The total capacity of the battery in kWh.
+- **`BATTERY_SIMULATION.BATTERY_PRICE`**: The price of the battery (used for payback calculation).
+- **`BATTERY_SIMULATION.MAX_CHARGING_RATE_KWH`**: The maximum charging rate of the battery in kWh per hour.
+- **`BATTERY_SIMULATION.MAX_DISCHARGING_RATE_KWH`**: The maximum discharging rate of the battery in kWh per hour.
+- **`BATTERY_SIMULATION.ROUND_TRIP_EFFICIENCY`**: The round-trip efficiency of the battery (e.g., `0.8` for 80% efficiency).
+- **`BATTERY_SIMULATION.DISCHARGE_MINIMUM_PERCENTAGE`**: The minimum battery level as a percentage of total capacity (e.g., `10` for 10%).
+- **`BATTERY_SIMULATION.CHARGE_MAXIMUM_PERCENTAGE`**: The maximum battery level as a percentage of total capacity (e.g., `90` for 90%).
+- **`BATTERY_SIMULATION.DYNAMIC_PRICE_THRESHOLD_LOW`**: The price threshold (€/kWh) below which the battery will charge during the `dynamic_cost_optimization` strategy.
+- **`BATTERY_SIMULATION.DYNAMIC_PRICE_THRESHOLD_HIGH`**: The price threshold (€/kWh) above which the battery will discharge during the `dynamic_cost_optimization` strategy.
 
 ---
 
@@ -110,16 +167,19 @@ Then export the result as json and move it to the data folder as export.json
      ```bash
      cp config.template.json config.json
      ```
-   - Edit the [config.json](http://_vscodecontentref_/3) file and fill in the required values.
+   - Edit the `config.json` file and fill in the required values for your setup.
 
-3. **Run the Script**:
+3. **Prepare Data**:
+   - Ensure your data files (from Victoria Metrics or SQLite export) are in the correct location as described above.
+
+4. **Run the Script**:
    - Execute the script:
      ```bash
      python main.py
      ```
 
-4. **View Results**:
-   - The results will be saved as a CSV file in the [results](http://_vscodecontentref_/4) folder with a timestamped filename (e.g., `results/results_20250407_123456.csv`).
+5. **View Results**:
+   - The results will be saved as a CSV file in the `results` folder with a timestamped filename (e.g., `results/results_20250407_123456.csv`).
 
 ---
 
@@ -165,13 +225,16 @@ The monthly breakdown includes the following columns:
 3. **Stop Production for Negative Prices**:
    - Stops energy production when prices (including taxes) are negative, if enabled in the configuration.
 
-4. **Monthly Breakdown**:
+4. **Smart Heatpump Shifting**:
+   - Shifts heatpump consumption to cheaper hours without changing total annual consumption.
+
+5. **Monthly Breakdown**:
    - Provides a detailed breakdown of costs, income, consumption, and production for each calendar month.
 
-5. **CSV Output**:
+6. **CSV Output**:
    - Saves the results in a timestamped CSV file for easy analysis in Excel.
 
-6. **Debugging**:
+7. **Debugging**:
    - Enables detailed debug print statements when `DEBUG` is set to `true`.
 
 ---
@@ -186,3 +249,17 @@ DynamicEnergyPrices/
 ├── results/              # Folder for output CSV files
 ├── README.md             # Documentation
 └── other_files/          # Additional scripts or utilities
+```
+
+---
+
+## Troubleshooting
+
+- **Total consumption does not match expectations:**  
+  Ensure that your data files are complete and that the configuration matches your sensor IDs. If using smart heating or battery simulation, the script should only shift or buffer energy, not reduce total annual consumption.
+- **API errors or missing data:**  
+  Check your API URLs, keys, and network connectivity.
+- **Debugging:**  
+  Set `"DEBUG": true` in your `config.json` to enable detailed output.
+
+If you encounter issues, please check the debug output and review your configuration and data files.

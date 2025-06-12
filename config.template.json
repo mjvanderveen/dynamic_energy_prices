@@ -2,6 +2,7 @@
     "PARAMETERS": {
         "START_DATE": "YYYY-MM-DD",  
         "END_DATE": "YYYY-MM-DD",    
+        "BASELOAD_CONSUMPTION": 0.25,
         "STOP_PRODUCTION_NEGATIVE_PRICES": false,
         "SALDEREN": true,
         "DEBUG": true
@@ -14,15 +15,25 @@
         "VICTORIAMETRICS_URL": "http://<homeassistant-ip>:8428/api/v1/query_range",
         "DYNAMIC_PRICES_API_URL": "https://jeroen.nl/api/dynamische-energieprijzen", 
         "DYNAMIC_PRICES_API_KEY": "<your-api-key>"
-        },
+    },
     "CONSUMPTION_SENSORS": [
-        "sensor.energy_consumption_tarif_1",
-        "sensor.energy_consumption_tarif_2"
+        { "name": "energy_consumption_tarif_1", "sensor": "sensor.energy_consumption_tarif_1", "type": "counter", "data_gap_fill": "1d"},
+        { "name": "energy_consumption_tarif_2", "sensor": "sensor.energy_consumption_tarif_2", "type": "counter", "data_gap_fill": "1d"}
     ],
     "PRODUCTION_SENSORS": [
-        "sensor.energy_production_tarif_1",
-        "sensor.energy_production_tarif_2"
+        { "name": "energy_production_tarif_1", "sensor": "sensor.energy_production_tarif_1", "type": "counter", "data_gap_fill": "1d"},
+        { "name": "energy_production_tarif_2", "sensor": "sensor.energy_production_tarif_2", "type": "counter", "data_gap_fill": "1d"}   
     ],
+    "HEATPUMP" : {
+        "ENABLE_SMART_HEATING": true,
+        "STOP_HEATPUMP_ON_NUMBER_OF_MOST_EXPENSIVE_HOURS": 4,
+        "HEATPUMP_SENSORS": [
+            { "name": "HEATPUMP_POWER_OUTPUT_SENSOR", "sensor": "sensor.boiler_compressor_power_output", "type": "gauge",  "data_gap_fill": "1d"},
+            { "name": "HEATPUMP_CONSUMPTION_SENSOR", "sensor": "sensor.daily_heatpump_energy_consumption", "type": "counter", "resets": "yes", "data_gap_fill": "1d"},
+            { "name": "OUTSIDE_TEMPERATURE_SENSOR", "sensor": "sensor.boiler_outside_temperature", "type": "gauge", "data_gap_fill": "1d"}
+        ],
+        "FULL_TIME_RUNNING_MINIMUM_THRESHOLD_BASED_ON_OUTSIDE_TEMPERATURE": 0
+    },    
     "TAXES": {
         "ENERGY_TAX": 0.102,
         "STORAGE_COSTS": 0.027,
