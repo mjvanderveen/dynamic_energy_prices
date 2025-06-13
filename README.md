@@ -124,6 +124,42 @@ To enable and configure smart heating for your heatpump, use the `HEATPUMP` obje
 },
 ```
 
+### Smart Car Charging
+
+The script supports **smart car charging**, which automatically shifts car charging to the cheapest hours of the day based on dynamic energy prices. This feature helps minimize charging costs by prioritizing hours with the lowest (even negative) prices, while respecting the maximum charging rate per hour.
+
+#### How it works
+
+- The total car charging energy per day is calculated.
+- Charging is redistributed to the hours with the lowest price, up to the configured maximum charging rate per hour (`MAX_CHARGING_RATE_KWH`).
+- The logic ensures that the total annual car charging energy remains unchanged; only the timing is optimized.
+- If solar production is available during a charging hour, it is used first before drawing from the grid.
+
+#### Configuration
+
+Configure smart car charging in your `config.json` under the `CAR` section:
+
+```json
+"CAR": {
+    "ENABLE_SMART_CHARGING": true,
+    "MAX_CHARGING_RATE_KWH": 4.4,
+    "CAR_SENSORS": [
+        { "name": "CAR_BATTERY_CHARGE_POWER", "sensor": "sensor.myenergi_zappi_17051981_energy_used_today", "type": "counter", "resets": "no", "data_gap_fill": "1h"}
+    ]
+}
+```
+
+- **ENABLE_SMART_CHARGING**: Set to `true` to enable smart charging optimization.
+- **MAX_CHARGING_RATE_KWH**: The maximum kWh that can be charged per hour.
+- **CAR_SENSORS**: List your car charging sensors here.
+
+#### Notes
+
+- Smart car charging only shifts the timing of charging; it does **not** reduce total annual consumption.
+- The script ensures that car charging is never double-counted or lost during shifting.
+- Charging is always prioritized in the hours with the lowest price, including negative price hours.
+
+
 ### Taxes and Costs
 
 - **`ENERGY_TAX`**: Energy tax per kWh (in euro). Used in price calculations for both consumption and production.

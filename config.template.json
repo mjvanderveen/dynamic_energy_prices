@@ -33,7 +33,14 @@
             { "name": "OUTSIDE_TEMPERATURE_SENSOR", "sensor": "sensor.boiler_outside_temperature", "type": "gauge", "data_gap_fill": "1d"}
         ],
         "FULL_TIME_RUNNING_MINIMUM_THRESHOLD_BASED_ON_OUTSIDE_TEMPERATURE": 0
-    },    
+    },  
+    "CAR": {
+        "ENABLE_SMART_CHARGING": true,
+        "MAX_CHARGING_RATE_KWH": 4.4,
+        "CAR_SENSORS": [
+            { "name": "CAR_BATTERY_CHARGE_POWER", "sensor": "sensor.myenergi_zappi_17051981_energy_used_today", "type": "counter", "resets": "no", "data_gap_fill": "1h"}
+        ]
+    },
     "TAXES": {
         "ENERGY_TAX": 0.102,
         "STORAGE_COSTS": 0.027,

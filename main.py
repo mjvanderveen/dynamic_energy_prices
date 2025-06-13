@@ -118,11 +118,12 @@ def fetch_sensor_data_from_json(file_path, start_date, end_date, sensor_ids, out
         print(f"Error reading or parsing JSON file {file_path}: {e}")
         return {}
     
-def fetch_sensor_data_victoriametrics(sensor_objs, start_date, end_date, output_file):
+def fetch_sensor_data_victoriametrics(sensor_objs, start_date, end_date, output_file, config_array_name=None):
     """
     Fetches sensor data from VictoriaMetrics for the given sensor objects and date range.
     Uses per-sensor 'type', 'interval', and 'data_gap_fill' from config.json.
     If multiple sensors are combined in one query, only store the combined result once.
+    The result_sensor_id will be the config_array_name if provided (e.g., "CAR_SENSORS").
     """
     combined_data = []  # List to store combined raw data for all sensors
     hourly_totals = {}  # Dictionary to store hourly increments
@@ -146,17 +147,19 @@ def fetch_sensor_data_victoriametrics(sensor_objs, start_date, end_date, output_
         if sensor_type == "counter":
             if resets == "yes":
                 # Counter resets, use the current formula
-                query = f'clamp_min(delta(last_over_time({sensor_id}_value[1d])[1h]),0) offset 1h'
+                query = f'clamp_min(delta(last_over_time({sensor_id}_value[1d])[1h]),0) offset -1h'
                 result_sensor_id = sensor_id
             else:
                 # Only process the group once
-                if tuple(sorted([s["sensor"] for s in counter_group])) in processed_counters:
+                group_key = tuple(sorted([s["sensor"] for s in counter_group]))
+                if group_key in processed_counters:
                     continue
                 group_sensors = [s["sensor"] for s in counter_group]
                 sensor_regex = "|".join([f"{s}_value" for s in group_sensors])
-                query = f'sum(increase(last_over_time({{__name__=~"{sensor_regex}"}}[1d])))'
-                result_sensor_id = "combined_counter"
-                processed_counters.add(tuple(sorted(group_sensors)))
+                query = f'sum(increase(last_over_time({{__name__=~"{sensor_regex}"}}[{data_gap_fill}])))'
+                # Use config_array_name as the result_sensor_id if provided
+                result_sensor_id = config_array_name if config_array_name else "combined_counter"
+                processed_counters.add(group_key)
         elif sensor_type == "gauge":
             # Gauge: just use the value
             if data_gap_fill:
@@ -694,6 +697,101 @@ def redistribute_skipped_kwh(hourly_data, config):
 
     return hourly_data
 
+def annotate_car_charging_solar(hourly_data, car_sensor_id):
+    """
+    Annotate each hourly record with the amount of car charging from solar and grid.
+    Between 05:00 and 19:00, 100% of charging is solar. Otherwise, 0% is solar.
+    """
+    for record in hourly_data:
+        ts = record["timestamp"]
+        hour = int(ts[11:13])
+        car_kwh = record.get(car_sensor_id, 0)
+        if 5 <= hour < 19:
+            record["car_charging_solar"] = car_kwh
+            record["car_charging_grid"] = 0
+        else:
+            record["car_charging_solar"] = 0
+            record["car_charging_grid"] = car_kwh
+
+def optimize_car_charging(hourly_data, car_sensor_id, config):
+    """
+    For each day, move the full kWh that was charged to the car (solar + grid) to the hours with the lowest dynamic price.
+    The maximum the car can charge in an hour is set in config["CAR"]["MAX_CHARGING_RATE_KWH"].
+    The first MAX_CHARGING_RATE_KWH kWh go to the cheapest hour, then the next, etc., until the full daily charged amount is redistributed.
+    Annotates each record with:
+      - car_charging_original: original kWh charged in this hour
+      - car_charging_shifted_out: kWh moved out of this hour
+      - car_charging_shifted_in: kWh moved into this hour
+      - car_charging_final: final kWh charged in this hour after shifting
+    """
+    from collections import defaultdict
+
+    max_rate = config.get("CAR", {}).get("MAX_CHARGING_RATE_KWH", 4.4)
+
+    # Group records by day
+    daily_records = defaultdict(list)
+    for record in hourly_data:
+        day = record["timestamp"][:10]
+        daily_records[day].append(record)
+
+    for day, records in daily_records.items():
+        # Track original values
+        for r in records:
+            r["car_charging_original"] = r.get(car_sensor_id, 0)
+            r["car_charging_shifted_out"] = r.get(car_sensor_id, 0)
+            r["car_charging_shifted_in"] = 0
+            r["car_charging_final"] = 0
+
+        # Total kWh charged to the car that day (solar + grid)
+        total_car_kwh = sum(r.get(car_sensor_id, 0) for r in records)
+        if total_car_kwh == 0:
+            continue
+
+        # Sort hours by price (ascending, so negative prices come first)
+        sorted_hours = sorted(records, key=lambda r: r["price_consumption"])
+
+        kwh_left = total_car_kwh
+        for r in sorted_hours:
+            if kwh_left <= 0:
+                break
+            add_kwh = min(max_rate, kwh_left)
+            r["car_charging_shifted_in"] = add_kwh
+            r["car_charging_final"] = add_kwh
+            kwh_left -= add_kwh
+
+    return hourly_data
+
+def apply_smart_car_charging_corrections(hourly_data, car_sensor_id):
+    """
+    Adjusts consumption and adjusted_production kWh based on smart car charging logic.
+    Ensures car charging is only counted once, even when shifted to a new hour.
+    Assumes all production is solar.
+    """
+    for record in hourly_data:
+        hour = int(record["timestamp"][11:13])
+        car_charging_orig = record.get("car_charging_original", 0)
+        car_charging_final = record.get("car_charging_final", 0)
+
+        # Step 1: Undo the original car charging effect
+        if car_charging_orig > 0:
+            orig_consumption = record.get("consumption", 0)
+            to_subtract = min(orig_consumption, car_charging_orig)
+            record["consumption"] = orig_consumption - to_subtract
+            remainder = car_charging_orig - to_subtract
+            if remainder > 0:
+                record["adjusted_production"] = record.get("adjusted_production", 0) + remainder
+
+        # Step 2: Apply the shifted car charging
+        if car_charging_final > 0:
+            production_available = record.get("adjusted_production", 0)
+            to_deduct = min(car_charging_final, production_available)
+            record["adjusted_production"] = production_available - to_deduct
+            remaining = car_charging_final - to_deduct
+            if remaining > 0:
+                record["consumption"] = record.get("consumption", 0) + remaining
+
+    return hourly_data
+
 def calculate_hourly_energy_prices(base_price, total_annual_consumption, total_annual_production, cumulative_production, salderen):
     """
     Calculate the hourly energy prices for consumption and production.
@@ -734,9 +832,12 @@ def get_heatpump_sensor_id(sensor_objs, name):
             return s["sensor"]
     return None
 
-def calculate_costs(consumption_data, production_data, price_data):
-    """Calculate energy costs, income, and total consumption/production, with battery simulation and smart heating."""
+def calculate_costs(consumption_data, production_data, price_data, car_sensor_id=None):
+    """Calculate energy costs, income, and total consumption/production, with battery simulation, smart heating, and car charging annotation."""
 
+    enable_smart_charging = config.get("CAR", {}).get("ENABLE_SMART_CHARGING", True)
+
+    # --- Step 0: Load configuration and constants ---
     # Get heatpump sensor IDs from config
     heatpump_sensor_objs = config["HEATPUMP"]["HEATPUMP_SENSORS"]
     outside_temp_sensor_id = get_heatpump_sensor_id(heatpump_sensor_objs, "OUTSIDE_TEMPERATURE_SENSOR")
@@ -749,9 +850,10 @@ def calculate_costs(consumption_data, production_data, price_data):
     start_datetime = datetime.strptime(START_DATE, "%Y-%m-%d")
     end_datetime = datetime.strptime(END_DATE, "%Y-%m-%d") + timedelta(days=1)
 
-    # Use only the combined_counter key for calculations
-    consumption_key = next(iter(consumption_data.keys()), None)
-    production_key = next(iter(production_data.keys()), None)
+    # Use only the array name key for calculations
+    consumption_key = "CONSUMPTION_SENSORS" if "CONSUMPTION_SENSORS" in consumption_data else next(iter(consumption_data.keys()), None)
+    production_key = "PRODUCTION_SENSORS" if "PRODUCTION_SENSORS" in production_data else next(iter(production_data.keys()), None)
+    car_key = car_sensor_id if car_sensor_id and car_sensor_id in consumption_data else None
 
     # Calculate total annual consumption and production
     total_annual_consumption = sum(
@@ -774,7 +876,7 @@ def calculate_costs(consumption_data, production_data, price_data):
 
         base_price = float(price_entry["prijs_excl_belastingen"].replace(",", "."))
 
-        # Use only the combined_counter for each hour
+        # Use only the array name for each hour
         hourly_consumption = consumption_data.get(consumption_key, {}).get(timestamp_str, 0) if consumption_key else 0
         hourly_production = production_data.get(production_key, {}).get(timestamp_str, 0) if production_key else 0
 
@@ -783,6 +885,9 @@ def calculate_costs(consumption_data, production_data, price_data):
         heatpump_consumption_sensor = consumption_data.get(heatpump_consumption_sensor_id, {}).get(timestamp_str, None) if heatpump_consumption_sensor_id else None
         power_output_sensor = consumption_data.get(power_output_sensor_id, {}).get(timestamp_str, None) if power_output_sensor_id else None
 
+        # Get car charging for this hour
+        car_charging_kwh = consumption_data.get(car_key, {}).get(timestamp_str, 0) if car_key else 0
+    
         cumulative_production += hourly_production
 
         hourly_price_consumption, hourly_price_production = calculate_hourly_energy_prices(
@@ -805,7 +910,20 @@ def calculate_costs(consumption_data, production_data, price_data):
             "heatpump_consumption_sensor": heatpump_consumption_sensor,
             "power_output_sensor": power_output_sensor,
         }
+        
+        if car_key:
+            record[car_key] = car_charging_kwh
         hourly_data.append(record)
+
+    # --- Step 1b: Annotate car charging solar/grid split ---
+    if car_key and enable_smart_charging:
+        annotate_car_charging_solar(hourly_data, car_key)
+
+
+    # --- Step 1c: Optimize car charging (move grid charging to cheaper hours) ---
+    if car_key and enable_smart_charging:
+        hourly_data = optimize_car_charging(hourly_data, car_key, config)
+        hourly_data = apply_smart_car_charging_corrections(hourly_data, car_key)
 
     # --- Step 2: Apply smart heating savings and redistribution ---
     monthly_savings, hourly_data = calculate_smart_heating_savings(hourly_data, config)
@@ -814,10 +932,8 @@ def calculate_costs(consumption_data, production_data, price_data):
     # --- Step 2b: Adjust main consumption kWh for heatpump saving mode ---
     if config["HEATPUMP"].get("ENABLE_SMART_HEATING", False):
         for record in hourly_data:
-            # If the original heatpump consumption is None, treat as 0
             orig_hp = record.get("original_heatpump_consumption", 0) or 0
             final_hp = record.get("heatpump_consumption_final", 0) or 0
-            # Remove the original heatpump part (if present), add the redistributed one
             record["consumption"] = (record.get("consumption", 0) or 0) - orig_hp + final_hp
 
     # --- Step 3: Use adjusted heatpump consumption for further calculations ---
@@ -1151,6 +1267,10 @@ def write_results_to_excel(
         "Is Top N Most Expensive Hour",
         "Cost (Non-Battery)",
         "Income (Non-Battery)",
+        "Car Charging Original (kWh)",
+        "Car Charging Shifted Out (kWh)",
+        "Car Charging Shifted In (kWh)",
+        "Car Charging Final (kWh)"
     ]
 
     if config["BATTERY_SIMULATION"]["ENABLE"]:
@@ -1207,6 +1327,13 @@ def write_results_to_excel(
             round(non_battery_cost, 2),
             round(non_battery_income, 2)
         ]
+
+        row.extend([
+            record.get("car_charging_original", ""),
+            record.get("car_charging_shifted_out", ""),
+            record.get("car_charging_shifted_in", ""),
+            record.get("car_charging_final", "")
+        ])
 
         if config["BATTERY_SIMULATION"]["ENABLE"]:
             battery_cost = (
@@ -1353,6 +1480,15 @@ def convert_raw_list_to_dict(raw_list):
             result[sensor][ts] = val
     return result
 
+def combine_sensors(sensor_data, sensor_ids, combined_key):
+    """Combine multiple sensor series into a single dict under combined_key."""
+    combined = {}
+    for sensor_id in sensor_ids:
+        for ts, val in sensor_data.get(sensor_id, {}).items():
+            combined[ts] = combined.get(ts, 0) + val
+    if combined:
+        sensor_data[combined_key] = combined
+
 def main():
     # Fetch sensor data from export.json or VictoriaMetrics
     use_export_json = config["DATA"].get("USE_EXPORT_JSON", True)
@@ -1366,10 +1502,19 @@ def main():
     heatpump_sensor_ids = [s["sensor"] for s in heatpump_sensor_objs]
     all_consumption_sensor_objs = [s for s in consumption_sensor_objs if s["sensor"] not in heatpump_sensor_ids]
 
+    # Prepare car sensor objects from config
+    car_sensor_objs = config.get("CAR", {}).get("CAR_SENSORS", [])
+
+    # --- Use array names for combined sensors ---
+    consumption_array_name = "CONSUMPTION_SENSORS"
+    production_array_name = "PRODUCTION_SENSORS"
+    car_array_name = "CAR_SENSORS"
+
     # Try to load raw data from JSON files first
     raw_consumption_path = os.path.join(script_dir, "data", "raw_consumption_data.json")
     raw_production_path = os.path.join(script_dir, "data", "raw_production_data.json")
     raw_heatpump_path = os.path.join(script_dir, "data", "raw_heatpump_data.json")
+    raw_car_path = os.path.join(script_dir, "data", "raw_car_data.json")
 
     def load_json_data(filepath):
         try:
@@ -1382,6 +1527,7 @@ def main():
     raw_consumption_data = load_json_data(raw_consumption_path)
     raw_production_data = load_json_data(raw_production_path)
     raw_heatpump_data = load_json_data(raw_heatpump_path)
+    raw_car_data = load_json_data(raw_car_path)
 
     # Convert list to dict-of-dicts if needed
     def convert_if_needed(raw_data):
@@ -1395,72 +1541,76 @@ def main():
     consumption_data = convert_if_needed(raw_consumption_data)
     production_data = convert_if_needed(raw_production_data)
     heatpump_data = convert_if_needed(raw_heatpump_data)
+    car_data = convert_if_needed(raw_car_data)
 
     # Fetch data if not loaded from file
-    if consumption_data is None or production_data is None or heatpump_data is None:
+    if (
+        consumption_data is None
+        or production_data is None
+        or heatpump_data is None
+        or (car_sensor_objs and car_data is None)
+    ):
         if use_export_json:
             if consumption_data is None:
-                print("Fetching consumption data from export.json")
                 consumption_data = fetch_sensor_data_from_json(
                     config["DATA"].get("EXPORT_JSON_PATH", "data/export.json"),
                     START_DATE, END_DATE, [s["sensor"] for s in all_consumption_sensor_objs]
                 )
-                print("Consumption data fetched from export.json.")
-
             if production_data is None:
-                print("Fetching production data from export.json")
                 production_data = fetch_sensor_data_from_json(
                     config["DATA"].get("EXPORT_JSON_PATH", "data/export.json"),
                     START_DATE, END_DATE, [s["sensor"] for s in production_sensor_objs]
                 )
-                print("Production data fetched from export.json.")
-
             if heatpump_data is None:
-                print("Fetching heatpump data from export.json")
                 heatpump_data = fetch_sensor_data_from_json(
                     config["DATA"].get("EXPORT_JSON_PATH", "data/export.json"),
                     START_DATE, END_DATE, [s["sensor"] for s in heatpump_sensor_objs]
                 )
-                print("Heatpump data fetched from export.json.")
+            if car_sensor_objs and car_data is None:
+                car_data = fetch_sensor_data_from_json(
+                    config["DATA"].get("EXPORT_JSON_PATH", "data/export.json"),
+                    START_DATE, END_DATE, [s["sensor"] for s in car_sensor_objs]
+                )
         else:
             if consumption_data is None:
-                print(f"Fetching consumption data from VictoriaMetrics from {sensor_start_date} to {sensor_end_date}")
                 consumption_data = fetch_sensor_data_victoriametrics(
-                    all_consumption_sensor_objs, sensor_start_date, sensor_end_date, "raw_consumption_data.json"
+                    all_consumption_sensor_objs, sensor_start_date, sensor_end_date, "raw_consumption_data.json", config_array_name=consumption_array_name
                 )
-                print("Consumption data fetched and saved to raw_consumption_data.json.")
-
             if production_data is None:
-                print("Fetching production data from VictoriaMetrics")
                 production_data = fetch_sensor_data_victoriametrics(
-                    production_sensor_objs, sensor_start_date, sensor_end_date, "raw_production_data.json"
+                    production_sensor_objs, sensor_start_date, sensor_end_date, "raw_production_data.json", config_array_name=production_array_name
                 )
-                print("Production data fetched and saved to raw_production_data.json.")
-
             if heatpump_data is None:
-                print("Fetching heatpump data from VictoriaMetrics (per-sensor data_gap_fill)")
                 heatpump_data = fetch_sensor_data_victoriametrics(
                     heatpump_sensor_objs, sensor_start_date, sensor_end_date, "raw_heatpump_data.json"
                 )
-                print("Heatpump data fetched and saved to raw_heatpump_data.json.")
+            if car_sensor_objs and car_data is None:
+                car_data = fetch_sensor_data_victoriametrics(
+                    car_sensor_objs, sensor_start_date, sensor_end_date, "raw_car_data.json", config_array_name=car_array_name
+                )
 
-    # Merge heatpump_data into consumption_data for downstream processing
-    for sensor in heatpump_sensor_ids:
-        if sensor not in consumption_data and sensor in heatpump_data:
-            consumption_data[sensor] = heatpump_data[sensor]
+    # Ensure data dicts are not None
+    if consumption_data is None:
+        consumption_data = {}
+    if production_data is None:
+        production_data = {}
+    if heatpump_data is None:
+        heatpump_data = {}
+    if car_data is None:
+        car_data = {}
+
+    # --- Merge car_data into consumption_data under CAR_SENSORS if present ---
+    if car_data and "CAR_SENSORS" in car_data:
+        consumption_data["CAR_SENSORS"] = car_data["CAR_SENSORS"]
+
+    # --- Combine sensors under array names for consistent downstream processing ---
+    combine_sensors(consumption_data, [s["sensor"] for s in config["CONSUMPTION_SENSORS"]], "CONSUMPTION_SENSORS")
+    if car_sensor_objs:
+        combine_sensors(consumption_data, [s["sensor"] for s in car_sensor_objs], "CAR_SENSORS")
+    combine_sensors(production_data, [s["sensor"] for s in config["PRODUCTION_SENSORS"]], "PRODUCTION_SENSORS")
 
     # Fetch dynamic prices
     price_data = fetch_dynamic_prices(START_DATE, END_DATE)
-
-    # --- Only use the combined result for calculations ---
-    # For consumption and production, use the "combined_counter" key in your calculations
-    # If not present, fallback to the first available key (for single sensors)
-    combined_consumption_key = "combined_counter" if "combined_counter" in consumption_data else next(iter(consumption_data.keys()), None)
-    combined_production_key = "combined_counter" if "combined_counter" in production_data else next(iter(production_data.keys()), None)
-
-    # Prepare new dicts with only the combined result for calculations
-    consumption_data_combined = {combined_consumption_key: consumption_data[combined_consumption_key]} if combined_consumption_key else {}
-    production_data_combined = {combined_production_key: production_data[combined_production_key]} if combined_production_key else {}
 
     # --- Pass the full dicts to calculate_costs so all sensor data is available ---
     (
@@ -1477,7 +1627,7 @@ def main():
         total_discharged,
         charge_cycles,
         monthly_savings
-    ) = calculate_costs(consumption_data, production_data, price_data)
+    ) = calculate_costs(consumption_data, production_data, price_data, car_sensor_id=car_array_name)
 
     # Write results to an Excel file
     write_results_to_excel(
