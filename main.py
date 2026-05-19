@@ -1489,6 +1489,281 @@ def combine_sensors(sensor_data, sensor_ids, combined_key):
     if combined:
         sensor_data[combined_key] = combined
 
+def fetch_battery_simulation_data(start_date, end_date):
+    """
+    Fetch VictoriaMetrics data for all Home Battery Simulation instances configured under
+    config["BATTERY_SIZING"]["SIMULATIONS"].
+
+    Sensors fetched per simulation (counters use increase(), gauges use last_over_time()):
+      - total_money_saved          counter  total money saved in the period (€)
+      - money_saved_on_imports     counter  savings from offsetting grid purchases (€)
+      - extra_money_earned_on_exports  counter  extra earnings from exporting via battery (€)
+      - battery_energy_in          counter  kWh charged into the battery
+      - battery_energy_out         counter  kWh discharged from the battery
+      - current_charging_rate      gauge    instantaneous charge power per hour (kW) – used for inverter sizing
+      - current_discharging_rate   gauge    instantaneous discharge power per hour (kW) – used for inverter sizing
+
+    Returns:
+        dict: {simulation_name: {sensor_id: {timestamp_str: float_value}}}
+    """
+    simulations = config.get("BATTERY_SIZING", {}).get("SIMULATIONS", [])
+    if not simulations:
+        print("No BATTERY_SIZING.SIMULATIONS configured. Add a BATTERY_SIZING section to config.json.")
+        return {}
+
+    start_timestamp = int(datetime.strptime(start_date, "%Y-%m-%dT%H:%M:%SZ").timestamp())
+    end_timestamp = int(datetime.strptime(end_date, "%Y-%m-%dT%H:%M:%SZ").timestamp())
+
+    # Sensor definitions: (suffix, type)
+    SENSOR_DEFS = [
+        # (suffix, type, gap_fill, step)
+        # Rate sensors use max_over_time at 3600s step: captures hourly peak for inverter sizing.
+        ("_total_money_saved",             "counter",   "1d", "3600s"),
+        ("_money_saved_on_imports",        "counter",   "1d", "3600s"),
+        ("_extra_money_earned_on_exports", "counter",   "1d", "3600s"),
+        ("_battery_energy_in",             "counter",   "1d", "3600s"),
+        ("_battery_energy_out",            "counter",   "1d", "3600s"),
+        ("_current_charging_rate",         "gauge_max", "1h", "3600s"),
+        ("_current_discharging_rate",      "gauge_max", "1h", "3600s"),
+    ]
+
+    results = {}
+
+    for sim in simulations:
+        prefix = sim["prefix"]
+        sim_name = sim["name"]
+        results[sim_name] = {}
+
+        for suffix, sensor_type, gap_fill, step in SENSOR_DEFS:
+            sensor_id = f"sensor.{prefix}{suffix}"
+
+            if sensor_type == "counter":
+                query = f'increase(last_over_time({sensor_id}_value[{gap_fill}]))'
+            elif sensor_type == "gauge_max":
+                query = f'max_over_time({sensor_id}_value[{gap_fill}])'
+            else:
+                query = f'last_over_time({sensor_id}_value[{gap_fill}])'
+
+            print(f"Fetching {sensor_id} (simulation: {sim_name})...")
+            params = {
+                "query": query,
+                "start": start_timestamp,
+                "end": end_timestamp,
+                "step": step,
+            }
+
+            response = requests.get(VICTORIAMETRICS_URL, params=params)
+            if response.status_code == 200:
+                raw_results = response.json().get("data", {}).get("result", [])
+                hourly_values = {}
+                for result in raw_results:
+                    for ts, val in result.get("values", []):
+                        ts_str = datetime.fromtimestamp(int(ts), tz=__import__('datetime').timezone.utc).strftime("%Y-%m-%dT%H")
+                        hourly_values[ts_str] = float(val)
+                results[sim_name][sensor_id] = hourly_values
+                print(f"  -> {len(hourly_values)} hourly data points")
+            else:
+                print(f"  -> Failed: HTTP {response.status_code} {response.text}")
+                results[sim_name][sensor_id] = {}
+
+    # Persist raw data to disk for inspection / reuse
+    try:
+        data_folder = os.path.join(script_dir, "data")
+        os.makedirs(data_folder, exist_ok=True)
+        out_path = os.path.join(data_folder, "raw_battery_sizing_data.json")
+        with open(out_path, "w") as f:
+            json.dump(results, f, indent=4)
+        debug_print(f"Battery sizing raw data written to {out_path}")
+    except IOError as e:
+        debug_print(f"Failed to write battery sizing data: {e}")
+
+    return results
+
+
+def calculate_optimal_battery_sizing(simulation_data, start_date, end_date):
+    """
+    Analyse fetched battery simulation data to determine the optimal battery capacity (kWh)
+    and inverter size (kW).
+
+    Battery capacity is scored by payback period (shorter = better).
+    Inverter size recommendation is derived from the 95th-percentile of actual charge/discharge
+    power rates observed during the simulation period, giving a practical upper bound that
+    avoids over-sizing for rare peaks.
+
+    Args:
+        simulation_data (dict): Output of fetch_battery_simulation_data().
+        start_date (str): "YYYY-MM-DD" or "YYYY-MM-DDTHH:MM:SSZ"
+        end_date (str):   "YYYY-MM-DD" or "YYYY-MM-DDTHH:MM:SSZ"
+
+    Returns:
+        list[dict]: One entry per simulation with all computed metrics.
+    """
+    simulations = config.get("BATTERY_SIZING", {}).get("SIMULATIONS", [])
+    if not simulations:
+        print("No BATTERY_SIZING.SIMULATIONS configured.")
+        return []
+
+    # Normalise date strings
+    start_str = start_date.replace("T00:00:00Z", "").split("T")[0]
+    end_str   = end_date.replace("T23:59:59Z", "").split("T")[0]
+    start_dt  = datetime.strptime(start_str, "%Y-%m-%d")
+    end_dt    = datetime.strptime(end_str,   "%Y-%m-%d")
+    period_years = max((end_dt - start_dt).days / 365.0, 1 / 365)
+
+    def percentile(values, pct):
+        if not values:
+            return 0.0
+        sorted_vals = sorted(values)
+        idx = int(len(sorted_vals) * pct / 100)
+        return sorted_vals[min(idx, len(sorted_vals) - 1)]
+
+    analysis = []
+
+    for sim in simulations:
+        sim_name    = sim["name"]
+        prefix      = sim["prefix"]
+        size_kwh    = sim["size_kwh"]
+        inverter_kw = sim["inverter_kw"]
+        price_eur   = sim.get("price_eur", 0)
+
+        sensors = simulation_data.get(sim_name, {})
+
+        def total(suffix):
+            sid = f"sensor.{prefix}{suffix}"
+            return sum(v for v in sensors.get(sid, {}).values() if v > 0)
+
+        def values_list(suffix):
+            sid = f"sensor.{prefix}{suffix}"
+            return [v for v in sensors.get(sid, {}).values() if v > 0]
+
+        total_money_saved       = total("_total_money_saved")
+        money_saved_imports     = total("_money_saved_on_imports")
+        extra_earned_exports    = total("_extra_money_earned_on_exports")
+        energy_in_kwh           = total("_battery_energy_in")
+        energy_out_kwh          = total("_battery_energy_out")
+
+        # Fallback: total_money_saved is unreliable for some batteries (rarely updated).
+        # Use money_saved_on_imports + extra_money_earned_on_exports when it's near zero.
+        if total_money_saved < money_saved_imports * 0.5:
+            total_money_saved = money_saved_imports + extra_earned_exports
+
+        # Rate sensors give peak kW per hour — used only for Max kW and P95 kW thresholds.
+        rate_charge_vals    = values_list("_current_charging_rate")
+        rate_discharge_vals = values_list("_current_discharging_rate")
+        # Energy sensors give actual kWh per hour — used for energy sums and Chg@P95 kWh.
+        energy_charge_vals    = values_list("_battery_energy_in")
+        energy_discharge_vals = values_list("_battery_energy_out")
+
+        annual_savings  = total_money_saved / period_years
+        payback_years   = price_eur / annual_savings if annual_savings > 0 else float("inf")
+
+        # Max kW and P95 kW from rate sensors (fall back to energy if rate unavailable).
+        rate_vals_chg = rate_charge_vals    if rate_charge_vals    else energy_charge_vals
+        rate_vals_dis = rate_discharge_vals if rate_discharge_vals else energy_discharge_vals
+
+        max_charge_kw    = max(rate_vals_chg, default=0)
+        p90_charge_kw    = percentile(rate_vals_chg, 90)
+        p95_charge_kw    = percentile(rate_vals_chg, 95)
+        max_discharge_kw = max(rate_vals_dis, default=0)
+        p90_discharge_kw = percentile(rate_vals_dis, 90)
+        p95_discharge_kw = percentile(rate_vals_dis, 95)
+
+        recommended_inverter_kw = min(
+            round(max(p95_charge_kw, p95_discharge_kw) * 2 + 0.5) / 2,
+            inverter_kw
+        )
+
+        # kWh captured if inverter is limited to P90/P95 rate:
+        # sum over hourly energy, clipping any hour where energy_kwh > threshold.
+        p90_captured_charge_kwh    = sum(min(v, p90_charge_kw)    for v in energy_charge_vals)
+        p90_captured_discharge_kwh = sum(min(v, p90_discharge_kw) for v in energy_discharge_vals)
+        p95_captured_charge_kwh    = sum(min(v, p95_charge_kw)    for v in energy_charge_vals)
+        p95_captured_discharge_kwh = sum(min(v, p95_discharge_kw) for v in energy_discharge_vals)
+
+        entry = {
+            "name":                        sim_name,
+            "size_kwh":                    size_kwh,
+            "inverter_kw":                 inverter_kw,
+            "price_eur":                   price_eur,
+            "period_years":                round(period_years, 2),
+            "total_money_saved_eur":       round(total_money_saved, 2),
+            "money_saved_imports_eur":     round(money_saved_imports, 2),
+            "extra_earned_exports_eur":    round(extra_earned_exports, 2),
+            "annual_savings_eur":          round(annual_savings, 2),
+            "payback_years":               round(payback_years, 2) if payback_years != float("inf") else None,
+            "energy_in_kwh":               round(energy_in_kwh, 1),
+            "energy_out_kwh":              round(energy_out_kwh, 1),
+            "max_charge_kw":               round(max_charge_kw, 2),
+            "p90_charge_kw":               round(p90_charge_kw, 2),
+            "p90_captured_charge_kwh":     round(p90_captured_charge_kwh, 1),
+            "p95_charge_kw":               round(p95_charge_kw, 2),
+            "p95_captured_charge_kwh":     round(p95_captured_charge_kwh, 1),
+            "max_discharge_kw":            round(max_discharge_kw, 2),
+            "p90_discharge_kw":            round(p90_discharge_kw, 2),
+            "p90_captured_discharge_kwh":  round(p90_captured_discharge_kwh, 1),
+            "p95_discharge_kw":            round(p95_discharge_kw, 2),
+            "p95_captured_discharge_kwh":  round(p95_captured_discharge_kwh, 1),
+            "recommended_inverter_kw":     recommended_inverter_kw,
+        }
+        analysis.append(entry)
+
+    # Print summary table
+    print("\n" + "=" * 80)
+    print("  BATTERY SIZING ANALYSIS")
+    print("=" * 80)
+    print(f"  Period : {start_date} → {end_date}  ({period_years:.2f} years)")
+    print()
+
+    # Table 1 – energy throughput
+    print(f"  {'Simulation':<26} {'Size kWh':>9} {'Charged kWh':>12} {'Discharged kWh':>15}")
+    print("  " + "-" * 64)
+    for e in analysis:
+        print(
+            f"  {e['name']:<26} {e['size_kwh']:>9.1f}"
+            f" {e['energy_in_kwh']:>12.1f} {e['energy_out_kwh']:>15.1f}"
+        )
+    print()
+
+    # Table 2 – P90/P95 inverter sizing
+    print(f"  {'Simulation':<26} {'Max chg kW':>11} {'P90chg kW':>10} {'Chg@P90 kWh':>12} {'P95chg kW':>10} {'Chg@P95 kWh':>12} {'Max dis kW':>11} {'P90dis kW':>10} {'Dis@P90 kWh':>12} {'P95dis kW':>10} {'Dis@P95 kWh':>12} {'Rec.inv kW':>11}")
+    print("  " + "-" * 133)
+    for e in analysis:
+        print(
+            f"  {e['name']:<26}"
+            f" {e['max_charge_kw']:>11.2f} {e['p90_charge_kw']:>10.2f} {e['p90_captured_charge_kwh']:>12.1f}"
+            f" {e['p95_charge_kw']:>10.2f} {e['p95_captured_charge_kwh']:>12.1f}"
+            f" {e['max_discharge_kw']:>11.2f} {e['p90_discharge_kw']:>10.2f} {e['p90_captured_discharge_kwh']:>12.1f}"
+            f" {e['p95_discharge_kw']:>10.2f} {e['p95_captured_discharge_kwh']:>12.1f}"
+            f" {e['recommended_inverter_kw']:>11.1f}"
+        )
+    print()
+
+    # Table 3 – financials
+    print(f"  {'Simulation':<26} {'Total €':>9} {'Ann.€/yr':>9} {'Payback':>8}")
+    print("  " + "-" * 54)
+    for e in analysis:
+        payback_str = f"{e['payback_years']:.1f}" if e["payback_years"] is not None else "n/a"
+        print(
+            f"  {e['name']:<26}"
+            f" {e['total_money_saved_eur']:>9.2f} {e['annual_savings_eur']:>9.2f} {payback_str:>8}"
+        )
+    print("=" * 80)
+
+    valid = [e for e in analysis if e["payback_years"] is not None]
+    if valid:
+        best = min(valid, key=lambda x: x["payback_years"])
+        print(f"\n  Optimal battery size : {best['size_kwh']} kWh  ({best['name']})")
+        print(f"  Annual savings       : €{best['annual_savings_eur']:.2f}")
+        print(f"  Payback period       : {best['payback_years']:.1f} years")
+        print(f"  Recommended inverter : {best['recommended_inverter_kw']} kW")
+        print(f"  (P90 charge {best['p90_charge_kw']} kW / P95 charge {best['p95_charge_kw']} kW  |  P90 dis {best['p90_discharge_kw']} kW / P95 dis {best['p95_discharge_kw']} kW)")
+    else:
+        print("\n  No savings data available – check sensor names in BATTERY_SIZING config.")
+
+    print("=" * 80 + "\n")
+    return analysis
+
+
 def main():
     # Fetch sensor data from export.json or VictoriaMetrics
     use_export_json = config["DATA"].get("USE_EXPORT_JSON", True)
@@ -1645,6 +1920,11 @@ def main():
         charge_cycles,
         monthly_savings
     )
+
+    # --- Battery sizing optimisation (VictoriaMetrics only) ---
+    if not use_export_json and config.get("BATTERY_SIZING", {}).get("SIMULATIONS"):
+        sizing_data = fetch_battery_simulation_data(sensor_start_date, sensor_end_date)
+        calculate_optimal_battery_sizing(sizing_data, START_DATE, END_DATE)
 
 if __name__ == "__main__":
     main()

@@ -63,5 +63,30 @@
         "CHARGE_MAXIMUM_PERCENTAGE": 90,
         "DYNAMIC_PRICE_THRESHOLD_LOW": 0.10,
         "DYNAMIC_PRICE_THRESHOLD_HIGH": 0.25
+    },
+    "BATTERY_SIZING": {
+        "SIMULATIONS": [
+            {
+                "name": "22.1kWh_5kW",
+                "prefix": "battery_20w",
+                "size_kwh": 22.1,
+                "inverter_kw": 5.0,
+                "price_eur": 8000
+            },
+            {
+                "name": "10.2kWh_5.7kW",
+                "prefix": "battery_sim_byd_battery_box_hvs_10_2kwh",
+                "size_kwh": 10.2,
+                "inverter_kw": 5.7,
+                "price_eur": 4500
+            },
+            {
+                "name": "5.1kWh_5.7kW",
+                "prefix": "battery_sim_byd_battery_box_hvs_5_1kwh",
+                "size_kwh": 5.1,
+                "inverter_kw": 5.7,
+                "price_eur": 2500
+            }
+        ]
     }
 }
